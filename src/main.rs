@@ -4,7 +4,9 @@
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_nrf::{
-    bind_interrupts, peripherals,
+    bind_interrupts,
+    interrupt::Priority,
+    peripherals,
     twim::{self, Twim},
 };
 use embassy_time::{Duration, Timer};
@@ -112,18 +114,23 @@ fn crc8(data: &[u8]) -> u8 {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    let mut config = embassy_nrf::config::Config::default();
+    config.gpiote_interrupt_priority = Priority::P2;
+    config.time_interrupt_priority = Priority::P2;
+    config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
+
+    let p = embassy_nrf::init(config);
 
     // Change these pins to match your board.
     let sda = p.P0_20;
     let scl = p.P0_22;
 
-    let mut config = twim::Config::default();
-    config.frequency = twim::Frequency::K100;
+    let mut twim_config = twim::Config::default();
+    twim_config.frequency = twim::Frequency::K100;
 
     let mut twim_buffer = [0u8; 16];
 
-    let i2c = Twim::new(p.TWISPI0, Irqs, sda, scl, config, &mut twim_buffer);
+    let i2c = Twim::new(p.TWISPI0, Irqs, sda, scl, twim_config, &mut twim_buffer);
 
     let mut sht41 = Sht41::new(i2c);
 
