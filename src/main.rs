@@ -3,6 +3,8 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_nrf::radio;
+use embassy_nrf::radio::ieee802154::{Packet, Radio};
 use embassy_nrf::{
     bind_interrupts,
     interrupt::Priority,
@@ -11,14 +13,21 @@ use embassy_nrf::{
 };
 use embassy_time::{Duration, Timer};
 use embedded_hal_async::i2c::I2c;
+use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 bind_interrupts!(struct Irqs {
+    RADIO => radio::InterruptHandler<peripherals::RADIO>;
     TWISPI0 => twim::InterruptHandler<peripherals::TWISPI0>;
 });
 
 const SHT41_ADDR: u8 = 0x44;
 const CMD_MEASURE_HIGH_PRECISION: u8 = 0xFD;
+static TWIM_BUFFER: StaticCell<[u8; 16]> = StaticCell::new();
+
+const CHANNEL: u8 = 15;
+const PAN_ID: u16 = 0x06e6;
+const EXT_PAN_ID: u64 = 0x297c_f951_98ae_4f6c;
 
 #[derive(Debug)]
 pub enum Sht41Error<E> {
@@ -113,13 +122,16 @@ fn crc8(data: &[u8]) -> u8 {
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let mut config = embassy_nrf::config::Config::default();
     config.gpiote_interrupt_priority = Priority::P2;
     config.time_interrupt_priority = Priority::P2;
     config.hfclk_source = embassy_nrf::config::HfclkSource::ExternalXtal;
 
     let p = embassy_nrf::init(config);
+
+    let mut radio = Radio::new(p.RADIO, Irqs);
+    radio.set_channel(CHANNEL);
 
     // Change these pins to match your board.
     let sda = p.P0_20;
@@ -128,14 +140,36 @@ async fn main(_spawner: Spawner) {
     let mut twim_config = twim::Config::default();
     twim_config.frequency = twim::Frequency::K100;
 
-    let mut twim_buffer = [0u8; 16];
+    let twim_buffer = TWIM_BUFFER.init([0u8; 16]);
 
-    let i2c = Twim::new(p.TWISPI0, Irqs, sda, scl, twim_config, &mut twim_buffer);
+    let i2c = Twim::new(p.TWISPI0, Irqs, sda, scl, twim_config, twim_buffer);
 
-    let mut sht41 = Sht41::new(i2c);
+    let sht41 = Sht41::new(i2c);
 
     info!("SHT41 example started");
 
+    spawner.spawn(temperature_measurement(sht41).unwrap());
+
+    loop {
+        let mut packet = Packet::new();
+
+        match radio.receive(&mut packet).await {
+            Ok(()) => {
+                let frame: &[u8] = &packet;
+
+                defmt::info!("RX len={} lqi={}", frame.len(), packet.lqi());
+                decode_802154(frame);
+                defmt::info!("raw={:02x}", frame);
+            }
+            Err(_) => {
+                defmt::warn!("RX error");
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn temperature_measurement(mut sht41: Sht41<Twim<'static>>) -> ! {
     loop {
         match sht41.read().await {
             Ok((temp_c, rh)) => {
@@ -146,6 +180,191 @@ async fn main(_spawner: Spawner) {
             }
         }
 
-        Timer::after(Duration::from_secs(2)).await;
+        Timer::after(Duration::from_secs(10)).await;
     }
+}
+
+#[derive(Clone, Copy, defmt::Format)]
+enum FrameType {
+    Beacon,
+    Data,
+    Ack,
+    MacCommand,
+    Unknown(u8),
+}
+
+#[derive(Clone, Copy, defmt::Format)]
+enum AddrMode {
+    None,
+    Short,
+    Extended,
+    Reserved,
+}
+
+fn frame_type(v: u16) -> FrameType {
+    match (v & 0b111) as u8 {
+        0 => FrameType::Beacon,
+        1 => FrameType::Data,
+        2 => FrameType::Ack,
+        3 => FrameType::MacCommand,
+        x => FrameType::Unknown(x),
+    }
+}
+
+fn addr_mode(bits: u16) -> AddrMode {
+    match bits {
+        0 => AddrMode::None,
+        2 => AddrMode::Short,
+        3 => AddrMode::Extended,
+        _ => AddrMode::Reserved,
+    }
+}
+
+fn le_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+fn le_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+fn decode_802154(frame: &[u8]) {
+    if frame.len() < 3 {
+        defmt::warn!("too short len={}", frame.len());
+        return;
+    }
+
+    let fcf = le_u16(&frame[0..2]);
+    let seq = frame[2];
+
+    let ftype = frame_type(fcf);
+
+    let security_enabled = (fcf & (1 << 3)) != 0;
+    let frame_pending = (fcf & (1 << 4)) != 0;
+    let ack_request = (fcf & (1 << 5)) != 0;
+    let pan_compression = (fcf & (1 << 6)) != 0;
+
+    let dst_mode = addr_mode((fcf >> 10) & 0b11);
+    let frame_version = (fcf >> 12) & 0b11;
+    let src_mode = addr_mode((fcf >> 14) & 0b11);
+
+    defmt::info!(
+        "802.15.4 type={} seq={} security={} ack_req={} pan_comp={} ver={} dst_mode={} src_mode={}",
+        ftype,
+        seq,
+        security_enabled,
+        ack_request,
+        pan_compression,
+        frame_version,
+        dst_mode,
+        src_mode
+    );
+
+    let mut i = 3;
+
+    let mut dst_pan: Option<u16> = None;
+
+    match dst_mode {
+        AddrMode::None => {}
+        AddrMode::Short => {
+            if frame.len() < i + 2 + 2 {
+                defmt::warn!("truncated dst short addr");
+                return;
+            }
+
+            let pan = le_u16(&frame[i..i + 2]);
+            i += 2;
+
+            let addr = le_u16(&frame[i..i + 2]);
+            i += 2;
+
+            dst_pan = Some(pan);
+
+            defmt::info!("dst_pan={=u16:04x} dst_short={=u16:04x}", pan, addr);
+        }
+        AddrMode::Extended => {
+            if frame.len() < i + 2 + 8 {
+                defmt::warn!("truncated dst ext addr");
+                return;
+            }
+
+            let pan = le_u16(&frame[i..i + 2]);
+            i += 2;
+
+            let addr = le_u64(&frame[i..i + 8]);
+            i += 8;
+
+            dst_pan = Some(pan);
+
+            defmt::info!("dst_pan={=u16:04x} dst_ext={=u64:016x}", pan, addr);
+        }
+        AddrMode::Reserved => {
+            defmt::warn!("reserved dst addr mode");
+            return;
+        }
+    }
+
+    match src_mode {
+        AddrMode::None => {}
+        AddrMode::Short => {
+            if !pan_compression {
+                if frame.len() < i + 2 {
+                    defmt::warn!("truncated src pan");
+                    return;
+                }
+
+                let src_pan = le_u16(&frame[i..i + 2]);
+                i += 2;
+
+                defmt::info!("src_pan={=u16:04x}", src_pan);
+            } else if let Some(pan) = dst_pan {
+                defmt::info!("src_pan compressed={=u16:04x}", pan);
+            }
+
+            if frame.len() < i + 2 {
+                defmt::warn!("truncated src short addr");
+                return;
+            }
+
+            let addr = le_u16(&frame[i..i + 2]);
+            i += 2;
+
+            defmt::info!("src_short={=u16:04x}", addr);
+        }
+        AddrMode::Extended => {
+            if !pan_compression {
+                if frame.len() < i + 2 {
+                    defmt::warn!("truncated src pan");
+                    return;
+                }
+
+                let src_pan = le_u16(&frame[i..i + 2]);
+                i += 2;
+
+                defmt::info!("src_pan={=u16:04x}", src_pan);
+            } else if let Some(pan) = dst_pan {
+                defmt::info!("src_pan compressed={=u16:04x}", pan);
+            }
+
+            if frame.len() < i + 8 {
+                defmt::warn!("truncated src ext addr");
+                return;
+            }
+
+            let addr = le_u64(&frame[i..i + 8]);
+            i += 8;
+
+            defmt::info!("src_ext={=u64:016x}", addr);
+        }
+        AddrMode::Reserved => {
+            defmt::warn!("reserved src addr mode");
+            return;
+        }
+    }
+
+    defmt::info!(
+        "header_len={} payload_len={}",
+        i,
+        frame.len().saturating_sub(i)
+    );
 }

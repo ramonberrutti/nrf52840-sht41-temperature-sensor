@@ -14,3 +14,4 @@ defmt-rtt = "1"
 cortex-m = {version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 panic-probe = { version = "1", features = ["print-defmt"]}
+static_cell = "2"
