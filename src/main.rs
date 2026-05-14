@@ -48,6 +48,43 @@ struct SeenShortDevice {
     count: u32,
 }
 
+#[derive(Clone, Copy)]
+struct ShortToExtAddr {
+    short_addr: u16,
+    ext_addr: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MacSecurityHeader {
+    security_control: u8,
+    security_level: u8,
+    key_id_mode: u8,
+    frame_counter: Option<u32>,
+    key_index: Option<u8>,
+}
+
+// Fill this manually from `ot-cli router table` / `child table` while learning.
+// Example:
+// ShortToExtAddr { short_addr: 0x4800, ext_addr: 0x723d_c405_c217_f1c0 },
+const SHORT_TO_EXT: &[ShortToExtAddr] = &[
+    ShortToExtAddr {
+        short_addr: 0x4800,
+        ext_addr: 0x723d_c405_c217_f1c0,
+    },
+    ShortToExtAddr {
+        short_addr: 0x9c00,
+        ext_addr: 0xfed7_66e8_f59c_7c32,
+    },
+    ShortToExtAddr {
+        short_addr: 0xa800,
+        ext_addr: 0xfe00_4145_170f_16b0,
+    },
+    ShortToExtAddr {
+        short_addr: 0xcc00,
+        ext_addr: 0x6257_22ce_831a_ccb4,
+    },
+];
+
 fn rloc16_child_id(addr: u16) -> u16 {
     addr & 0x003f
 }
@@ -58,6 +95,16 @@ fn rloc16_parent(addr: u16) -> u16 {
 
 fn rloc16_is_router(addr: u16) -> bool {
     rloc16_child_id(addr) == 0
+}
+
+fn lookup_ext_addr(short_addr: u16) -> Option<u64> {
+    for mapping in SHORT_TO_EXT {
+        if mapping.short_addr == short_addr {
+            return Some(mapping.ext_addr);
+        }
+    }
+
+    None
 }
 
 #[derive(Debug)]
@@ -461,6 +508,20 @@ struct ParsedSrcAddr {
     ext_addr: Option<u64>,
 }
 
+impl ParsedSrcAddr {
+    fn best_known_ext_addr(&self) -> Option<u64> {
+        if let Some(ext_addr) = self.ext_addr {
+            return Some(ext_addr);
+        }
+
+        if let Some(short_addr) = self.short_addr {
+            return lookup_ext_addr(short_addr);
+        }
+
+        None
+    }
+}
+
 struct Cursor<'a> {
     frame: &'a [u8],
     i: usize,
@@ -668,7 +729,7 @@ fn parse_src_addr(
     }
 }
 
-fn parse_security_header(c: &mut Cursor) -> Option<()> {
+fn parse_security_header(c: &mut Cursor) -> Option<MacSecurityHeader> {
     let security_control = c.u8()?;
 
     let security_level = security_control & 0b0000_0111;
@@ -685,10 +746,15 @@ fn parse_security_header(c: &mut Cursor) -> Option<()> {
         asn_in_nonce
     );
 
-    if !frame_counter_suppression {
+    let frame_counter = if !frame_counter_suppression {
         let frame_counter = c.u32_le()?;
         defmt::info!("frame_counter={=u32}", frame_counter);
-    }
+        Some(frame_counter)
+    } else {
+        None
+    };
+
+    let mut key_index = None;
 
     match key_id_mode {
         0 => {
@@ -696,34 +762,93 @@ fn parse_security_header(c: &mut Cursor) -> Option<()> {
         }
 
         1 => {
-            let key_index = c.u8()?;
-            defmt::info!("key_index={}", key_index);
+            let index = c.u8()?;
+            defmt::info!("key_index={}", index);
+            key_index = Some(index);
         }
 
         2 => {
             let key_source = c.u32_le()?;
-            let key_index = c.u8()?;
-            defmt::info!(
-                "key_source_4={=u32:08x} key_index={}",
-                key_source,
-                key_index
-            );
+            let index = c.u8()?;
+            defmt::info!("key_source_4={=u32:08x} key_index={}", key_source, index);
+            key_index = Some(index);
         }
 
         3 => {
             let key_source = c.u64_le()?;
-            let key_index = c.u8()?;
-            defmt::info!(
-                "key_source_8={=u64:016x} key_index={}",
-                key_source,
-                key_index
-            );
+            let index = c.u8()?;
+            defmt::info!("key_source_8={=u64:016x} key_index={}", key_source, index);
+            key_index = Some(index);
         }
 
         _ => {}
     }
 
-    Some(())
+    Some(MacSecurityHeader {
+        security_control,
+        security_level,
+        key_id_mode,
+        frame_counter,
+        key_index,
+    })
+}
+
+fn mic_len_for_security_level(security_level: u8) -> Option<usize> {
+    match security_level {
+        0 => Some(0),
+        1 | 5 => Some(4),
+        2 | 6 => Some(8),
+        3 | 7 => Some(16),
+        4 => Some(0),
+        _ => None,
+    }
+}
+
+fn log_secured_payload_split(
+    payload: &[u8],
+    security: MacSecurityHeader,
+    src_ext_addr: Option<u64>,
+) {
+    let Some(mic_len) = mic_len_for_security_level(security.security_level) else {
+        defmt::warn!("unknown MAC security level={}", security.security_level);
+        return;
+    };
+
+    if payload.len() < mic_len {
+        defmt::warn!(
+            "secured payload too short len={} mic_len={}",
+            payload.len(),
+            mic_len
+        );
+        return;
+    }
+
+    let encrypted_len = payload.len() - mic_len;
+    let encrypted = &payload[..encrypted_len];
+    let mic = &payload[encrypted_len..];
+
+    defmt::info!(
+        "secured payload split encrypted_len={} mic_len={} key_id_mode={} key_index={:?}",
+        encrypted_len,
+        mic_len,
+        security.key_id_mode,
+        security.key_index
+    );
+
+    if let Some(counter) = security.frame_counter {
+        defmt::info!("security nonce frame_counter={=u32}", counter);
+    } else {
+        defmt::warn!("security nonce missing frame counter");
+    }
+
+    if let Some(ext_addr) = src_ext_addr {
+        defmt::info!("security nonce src_ext={=u64:016x}", ext_addr);
+    } else {
+        defmt::warn!("security nonce missing source extended address mapping");
+    }
+
+    defmt::debug!("encrypted={:02x}", encrypted);
+    defmt::debug!("mic={:02x}", mic);
 }
 
 fn decode_lowpan_payload(payload: &[u8]) {
@@ -739,6 +864,7 @@ fn decode_lowpan_payload(payload: &[u8]) {
             "6LoWPAN: uncompressed IPv6 dispatch=0x41 len={}",
             payload.len()
         );
+        scan_for_mle_marker(payload);
         return;
     }
 
@@ -749,6 +875,7 @@ fn decode_lowpan_payload(payload: &[u8]) {
             payload.len()
         );
         decode_iphc_summary(payload);
+        scan_for_mle_marker(payload);
         return;
     }
 
@@ -837,6 +964,154 @@ fn decode_iphc_summary(payload: &[u8]) {
     }
 }
 
+fn scan_for_mle_marker(payload: &[u8]) {
+    const MLE_MARKER: &[u8; 4] = b"MLML";
+
+    if payload.len() < MLE_MARKER.len() {
+        return;
+    }
+
+    for i in 0..=payload.len() - MLE_MARKER.len() {
+        if &payload[i..i + MLE_MARKER.len()] == MLE_MARKER {
+            let after = &payload[i + MLE_MARKER.len()..];
+            let preview_len = after.len().min(16);
+
+            defmt::info!(
+                "MLE marker MLML found offset={} after_len={} preview={:02x}",
+                i,
+                after.len(),
+                &after[..preview_len]
+            );
+            decode_mle_candidate(after);
+            return;
+        }
+    }
+}
+
+fn decode_mle_candidate(after_mlml: &[u8]) {
+    if after_mlml.is_empty() {
+        defmt::warn!("MLE: marker found but no bytes after MLML");
+        return;
+    }
+
+    defmt::info!("MLE: candidate len={}", after_mlml.len());
+
+    // We are still learning the exact compressed UDP/MLE boundary.
+    // For now, print the first bytes in a structured way and scan for plausible TLVs.
+    let preview_len = after_mlml.len().min(24);
+    defmt::info!("MLE: bytes_after_mlml={:02x}", &after_mlml[..preview_len]);
+
+    scan_for_mle_tlvs(after_mlml);
+}
+
+fn mle_tlv_name(t: u8) -> &'static str {
+    match t {
+        0 => "Source Address",
+        1 => "Mode",
+        2 => "Timeout",
+        3 => "Challenge",
+        4 => "Response",
+        5 => "Link-layer Frame Counter",
+        6 => "MLE Frame Counter",
+        7 => "Route64",
+        8 => "Address16",
+        9 => "Leader Data",
+        10 => "Network Data",
+        11 => "TLV Request",
+        12 => "Scan Mask",
+        13 => "Connectivity",
+        14 => "Link Margin",
+        15 => "Status",
+        16 => "Version",
+        17 => "Address Registration",
+        18 => "Channel",
+        19 => "PAN ID",
+        20 => "Active Timestamp",
+        21 => "Pending Timestamp",
+        22 => "Active Operational Dataset",
+        23 => "Pending Operational Dataset",
+        24 => "Thread Discovery",
+        25 => "Unknown-25",
+        26 => "Unknown-26",
+        27 => "Unknown-27",
+        28 => "Unknown-28",
+        29 => "Unknown-29",
+        30 => "Unknown-30",
+        31 => "Unknown-31",
+        _ => "Unknown",
+    }
+}
+
+fn scan_for_mle_tlvs(bytes: &[u8]) {
+    // MLE TLVs are type-length-value, but the bytes immediately after MLML may include
+    // MLE security / command fields first. Try a few offsets and report plausible TLV runs.
+    for start in 0..bytes.len().min(12) {
+        let mut i = start;
+        let mut count = 0u8;
+
+        while i + 2 <= bytes.len() {
+            let tlv_type = bytes[i];
+            let tlv_len = bytes[i + 1] as usize;
+            let value_start = i + 2;
+            let value_end = value_start + tlv_len;
+
+            if value_end > bytes.len() {
+                break;
+            }
+
+            // Avoid reporting very unlikely runs caused by random encrypted/application bytes.
+            if tlv_type > 31 && count == 0 {
+                break;
+            }
+
+            count = count.wrapping_add(1);
+            i = value_end;
+
+            if count >= 2 {
+                defmt::info!("MLE: plausible TLV run starts at offset={}", start);
+                decode_mle_tlvs_from(bytes, start);
+                return;
+            }
+        }
+    }
+
+    defmt::info!("MLE: no obvious TLV run found yet");
+}
+
+fn decode_mle_tlvs_from(bytes: &[u8], start: usize) {
+    let mut i = start;
+
+    while i + 2 <= bytes.len() {
+        let tlv_type = bytes[i];
+        let tlv_len = bytes[i + 1] as usize;
+        let value_start = i + 2;
+        let value_end = value_start + tlv_len;
+
+        if value_end > bytes.len() {
+            defmt::warn!(
+                "MLE TLV truncated type={} len={} remaining={}",
+                tlv_type,
+                tlv_len,
+                bytes.len().saturating_sub(value_start)
+            );
+            return;
+        }
+
+        let value = &bytes[value_start..value_end];
+        let preview_len = value.len().min(12);
+
+        defmt::info!(
+            "MLE TLV type={} name={} len={} value_preview={:02x}",
+            tlv_type,
+            mle_tlv_name(tlv_type),
+            tlv_len,
+            &value[..preview_len]
+        );
+
+        i = value_end;
+    }
+}
+
 fn decode_802154(
     frame: &[u8],
     lqi: u8,
@@ -918,17 +1193,25 @@ fn decode_802154(
         }
     }
 
-    if fcf.security_enabled {
-        if parse_security_header(&mut c).is_none() {
-            defmt::warn!("failed parsing security header");
-            return;
+    let security = if fcf.security_enabled {
+        match parse_security_header(&mut c) {
+            Some(v) => Some(v),
+            None => {
+                defmt::warn!("failed parsing security header");
+                return;
+            }
         }
-    }
+    } else {
+        None
+    };
 
     defmt::info!("header_len={} remaining_len={}", c.pos(), c.remaining());
 
-    if fcf.security_enabled {
-        defmt::info!("payload is MAC-secured/encrypted; skipping 6LoWPAN decode");
+    if let Some(security) = security {
+        log_secured_payload_split(c.remaining_slice(), security, src.best_known_ext_addr());
+        defmt::info!(
+            "payload is MAC-secured/encrypted; skipping 6LoWPAN decode until AES-CCM is added"
+        );
     } else {
         decode_lowpan_payload(c.remaining_slice());
     }
