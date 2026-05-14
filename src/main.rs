@@ -479,6 +479,10 @@ impl<'a> Cursor<'a> {
         self.i
     }
 
+    fn remaining_slice(&self) -> &'a [u8] {
+        &self.frame[self.i..]
+    }
+
     fn u8(&mut self) -> Option<u8> {
         if self.remaining() < 1 {
             return None;
@@ -722,6 +726,117 @@ fn parse_security_header(c: &mut Cursor) -> Option<()> {
     Some(())
 }
 
+fn decode_lowpan_payload(payload: &[u8]) {
+    if payload.is_empty() {
+        defmt::info!("6LoWPAN: empty payload");
+        return;
+    }
+
+    let dispatch = payload[0];
+
+    if dispatch == 0x41 {
+        defmt::info!(
+            "6LoWPAN: uncompressed IPv6 dispatch=0x41 len={}",
+            payload.len()
+        );
+        return;
+    }
+
+    if dispatch & 0b1110_0000 == 0b0110_0000 {
+        defmt::info!(
+            "6LoWPAN: IPHC compressed IPv6 dispatch={=u8:02x} len={}",
+            dispatch,
+            payload.len()
+        );
+        decode_iphc_summary(payload);
+        return;
+    }
+
+    if dispatch & 0b1111_1000 == 0b1100_0000 {
+        defmt::info!(
+            "6LoWPAN: fragmentation first dispatch={=u8:02x} len={}",
+            dispatch,
+            payload.len()
+        );
+        return;
+    }
+
+    if dispatch & 0b1111_1000 == 0b1110_0000 {
+        defmt::info!(
+            "6LoWPAN: fragmentation subsequent dispatch={=u8:02x} len={}",
+            dispatch,
+            payload.len()
+        );
+        return;
+    }
+
+    if dispatch & 0b1100_0000 == 0b1000_0000 {
+        defmt::info!(
+            "6LoWPAN: mesh header dispatch={=u8:02x} len={}",
+            dispatch,
+            payload.len()
+        );
+        return;
+    }
+
+    if dispatch & 0b1110_0000 == 0b1010_0000 {
+        defmt::info!(
+            "6LoWPAN: broadcast header dispatch={=u8:02x} len={}",
+            dispatch,
+            payload.len()
+        );
+        return;
+    }
+
+    defmt::info!(
+        "6LoWPAN: unknown dispatch={=u8:02x} len={}",
+        dispatch,
+        payload.len()
+    );
+}
+
+fn decode_iphc_summary(payload: &[u8]) {
+    if payload.len() < 2 {
+        defmt::warn!("IPHC: truncated header");
+        return;
+    }
+
+    let b0 = payload[0];
+    let b1 = payload[1];
+
+    let tf = (b0 >> 3) & 0b11;
+    let nh_compressed = (b0 & (1 << 2)) != 0;
+    let hlim = b0 & 0b11;
+
+    let cid = (b1 & (1 << 7)) != 0;
+    let sac = (b1 & (1 << 6)) != 0;
+    let sam = (b1 >> 4) & 0b11;
+    let m = (b1 & (1 << 3)) != 0;
+    let dac = (b1 & (1 << 2)) != 0;
+    let dam = b1 & 0b11;
+
+    defmt::info!(
+        "IPHC: tf={} nh_compressed={} hlim={} cid={} sac={} sam={} multicast={} dac={} dam={}",
+        tf,
+        nh_compressed,
+        hlim,
+        cid,
+        sac,
+        sam,
+        m,
+        dac,
+        dam
+    );
+
+    if nh_compressed {
+        defmt::info!(
+            "IPHC: next header is compressed, likely NHC follows after compressed IPv6 fields"
+        );
+    } else {
+        defmt::info!("IPHC: next header is carried inline");
+    }
+}
+
 fn decode_802154(
     frame: &[u8],
     lqi: u8,
@@ -811,4 +926,10 @@ fn decode_802154(
     }
 
     defmt::info!("header_len={} remaining_len={}", c.pos(), c.remaining());
+
+    if fcf.security_enabled {
+        defmt::info!("payload is MAC-secured/encrypted; skipping 6LoWPAN decode");
+    } else {
+        decode_lowpan_payload(c.remaining_slice());
+    }
 }
