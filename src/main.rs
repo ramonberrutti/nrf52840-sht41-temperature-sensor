@@ -150,19 +150,34 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(temperature_measurement(sht41).unwrap());
 
+    let mut rx_ok: u32 = 0;
+    let mut rx_err: u32 = 0;
+
     loop {
         let mut packet = Packet::new();
 
         match radio.receive(&mut packet).await {
             Ok(()) => {
+                rx_ok = rx_ok.wrapping_add(1);
+
                 let frame: &[u8] = &packet;
 
-                defmt::info!("RX len={} lqi={}", frame.len(), packet.lqi());
+                defmt::info!(
+                    "RX ok={} err={} len={} lqi={}",
+                    rx_ok,
+                    rx_err,
+                    frame.len(),
+                    packet.lqi()
+                );
                 decode_802154(frame);
-                defmt::info!("raw={:02x}", frame);
+                defmt::debug!("raw={:02x}", frame);
             }
             Err(_) => {
-                defmt::warn!("RX error");
+                rx_err = rx_err.wrapping_add(1);
+
+                if rx_err % 100 == 0 {
+                    defmt::warn!("RX errors={} ok={}", rx_err, rx_ok);
+                }
             }
         }
     }
@@ -193,6 +208,12 @@ enum FrameType {
     Unknown(u8),
 }
 
+impl FrameType {
+    fn is_ack(self) -> bool {
+        matches!(self, FrameType::Ack)
+    }
+}
+
 #[derive(Clone, Copy, defmt::Format)]
 enum AddrMode {
     None,
@@ -201,8 +222,77 @@ enum AddrMode {
     Reserved,
 }
 
-fn frame_type(v: u16) -> FrameType {
-    match (v & 0b111) as u8 {
+struct Cursor<'a> {
+    frame: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(frame: &'a [u8]) -> Self {
+        Self { frame, i: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.frame.len().saturating_sub(self.i)
+    }
+
+    fn pos(&self) -> usize {
+        self.i
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        if self.remaining() < 1 {
+            return None;
+        }
+        let v = self.frame[self.i];
+        self.i += 1;
+        Some(v)
+    }
+
+    fn u16_le(&mut self) -> Option<u16> {
+        if self.remaining() < 2 {
+            return None;
+        }
+        let v = u16::from_le_bytes([self.frame[self.i], self.frame[self.i + 1]]);
+        self.i += 2;
+        Some(v)
+    }
+
+    fn u32_le(&mut self) -> Option<u32> {
+        if self.remaining() < 4 {
+            return None;
+        }
+        let v = u32::from_le_bytes([
+            self.frame[self.i],
+            self.frame[self.i + 1],
+            self.frame[self.i + 2],
+            self.frame[self.i + 3],
+        ]);
+        self.i += 4;
+        Some(v)
+    }
+
+    fn u64_le(&mut self) -> Option<u64> {
+        if self.remaining() < 8 {
+            return None;
+        }
+        let v = u64::from_le_bytes([
+            self.frame[self.i],
+            self.frame[self.i + 1],
+            self.frame[self.i + 2],
+            self.frame[self.i + 3],
+            self.frame[self.i + 4],
+            self.frame[self.i + 5],
+            self.frame[self.i + 6],
+            self.frame[self.i + 7],
+        ]);
+        self.i += 8;
+        Some(v)
+    }
+}
+
+fn parse_frame_type(fcf: u16) -> FrameType {
+    match (fcf & 0b111) as u8 {
         0 => FrameType::Beacon,
         1 => FrameType::Data,
         2 => FrameType::Ack,
@@ -211,7 +301,7 @@ fn frame_type(v: u16) -> FrameType {
     }
 }
 
-fn addr_mode(bits: u16) -> AddrMode {
+fn parse_addr_mode(bits: u16) -> AddrMode {
     match bits {
         0 => AddrMode::None,
         2 => AddrMode::Short,
@@ -220,151 +310,224 @@ fn addr_mode(bits: u16) -> AddrMode {
     }
 }
 
-fn le_u16(b: &[u8]) -> u16 {
-    u16::from_le_bytes([b[0], b[1]])
+struct FrameControl {
+    frame_type: FrameType,
+    security_enabled: bool,
+    frame_pending: bool,
+    ack_request: bool,
+    pan_compression: bool,
+    frame_version: u16,
+    dst_mode: AddrMode,
+    src_mode: AddrMode,
 }
 
-fn le_u64(b: &[u8]) -> u64 {
-    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+fn parse_fcf(fcf: u16) -> FrameControl {
+    FrameControl {
+        frame_type: parse_frame_type(fcf),
+        security_enabled: (fcf & (1 << 3)) != 0,
+        frame_pending: (fcf & (1 << 4)) != 0,
+        ack_request: (fcf & (1 << 5)) != 0,
+        pan_compression: (fcf & (1 << 6)) != 0,
+        dst_mode: parse_addr_mode((fcf >> 10) & 0b11),
+        frame_version: (fcf >> 12) & 0b11,
+        src_mode: parse_addr_mode((fcf >> 14) & 0b11),
+    }
+}
+
+fn parse_dst_addr(c: &mut Cursor, mode: AddrMode) -> Option<Option<u16>> {
+    match mode {
+        AddrMode::None => Some(None),
+
+        AddrMode::Short => {
+            let pan = c.u16_le()?;
+            let addr = c.u16_le()?;
+
+            defmt::info!("dst_pan={=u16:04x} dst_short={=u16:04x}", pan, addr);
+            Some(Some(pan))
+        }
+
+        AddrMode::Extended => {
+            let pan = c.u16_le()?;
+            let addr = c.u64_le()?;
+
+            defmt::info!("dst_pan={=u16:04x} dst_ext={=u64:016x}", pan, addr);
+            Some(Some(pan))
+        }
+
+        AddrMode::Reserved => {
+            defmt::warn!("reserved dst addr mode");
+            None
+        }
+    }
+}
+
+fn parse_src_addr(
+    c: &mut Cursor,
+    mode: AddrMode,
+    pan_compression: bool,
+    dst_pan: Option<u16>,
+) -> Option<()> {
+    match mode {
+        AddrMode::None => Some(()),
+
+        AddrMode::Short => {
+            if !pan_compression {
+                let src_pan = c.u16_le()?;
+                defmt::info!("src_pan={=u16:04x}", src_pan);
+            } else if let Some(pan) = dst_pan {
+                defmt::info!("src_pan compressed={=u16:04x}", pan);
+            }
+
+            let addr = c.u16_le()?;
+            defmt::info!("src_short={=u16:04x}", addr);
+
+            Some(())
+        }
+
+        AddrMode::Extended => {
+            if !pan_compression {
+                let src_pan = c.u16_le()?;
+                defmt::info!("src_pan={=u16:04x}", src_pan);
+            } else if let Some(pan) = dst_pan {
+                defmt::info!("src_pan compressed={=u16:04x}", pan);
+            }
+
+            let addr = c.u64_le()?;
+            defmt::info!("src_ext={=u64:016x}", addr);
+
+            Some(())
+        }
+
+        AddrMode::Reserved => {
+            defmt::warn!("reserved src addr mode");
+            None
+        }
+    }
+}
+
+fn parse_security_header(c: &mut Cursor) -> Option<()> {
+    let security_control = c.u8()?;
+
+    let security_level = security_control & 0b0000_0111;
+    let key_id_mode = (security_control >> 3) & 0b11;
+    let frame_counter_suppression = (security_control & (1 << 5)) != 0;
+    let asn_in_nonce = (security_control & (1 << 6)) != 0;
+
+    defmt::info!(
+        "security_control={=u8:02x} level={} key_id_mode={} frame_counter_suppression={} asn_in_nonce={}",
+        security_control,
+        security_level,
+        key_id_mode,
+        frame_counter_suppression,
+        asn_in_nonce
+    );
+
+    if !frame_counter_suppression {
+        let frame_counter = c.u32_le()?;
+        defmt::info!("frame_counter={=u32}", frame_counter);
+    }
+
+    match key_id_mode {
+        0 => {
+            defmt::info!("key_id_mode=implicit");
+        }
+
+        1 => {
+            let key_index = c.u8()?;
+            defmt::info!("key_index={}", key_index);
+        }
+
+        2 => {
+            let key_source = c.u32_le()?;
+            let key_index = c.u8()?;
+            defmt::info!(
+                "key_source_4={=u32:08x} key_index={}",
+                key_source,
+                key_index
+            );
+        }
+
+        3 => {
+            let key_source = c.u64_le()?;
+            let key_index = c.u8()?;
+            defmt::info!(
+                "key_source_8={=u64:016x} key_index={}",
+                key_source,
+                key_index
+            );
+        }
+
+        _ => {}
+    }
+
+    Some(())
 }
 
 fn decode_802154(frame: &[u8]) {
-    if frame.len() < 3 {
-        defmt::warn!("too short len={}", frame.len());
+    let mut c = Cursor::new(frame);
+
+    let fcf_raw = match c.u16_le() {
+        Some(v) => v,
+        None => {
+            defmt::warn!("too short: missing FCF len={}", frame.len());
+            return;
+        }
+    };
+
+    let seq = match c.u8() {
+        Some(v) => v,
+        None => {
+            defmt::warn!("too short: missing sequence len={}", frame.len());
+            return;
+        }
+    };
+
+    let fcf = parse_fcf(fcf_raw);
+
+    if fcf.frame_type.is_ack() {
+        defmt::info!("ACK seq={}", seq);
         return;
     }
 
-    let fcf = le_u16(&frame[0..2]);
-    let seq = frame[2];
-
-    let ftype = frame_type(fcf);
-
-    let security_enabled = (fcf & (1 << 3)) != 0;
-    let frame_pending = (fcf & (1 << 4)) != 0;
-    let ack_request = (fcf & (1 << 5)) != 0;
-    let pan_compression = (fcf & (1 << 6)) != 0;
-
-    let dst_mode = addr_mode((fcf >> 10) & 0b11);
-    let frame_version = (fcf >> 12) & 0b11;
-    let src_mode = addr_mode((fcf >> 14) & 0b11);
-
     defmt::info!(
-        "802.15.4 type={} seq={} security={} ack_req={} pan_comp={} ver={} dst_mode={} src_mode={}",
-        ftype,
+        "802.15.4 type={} seq={} security={} frame_pending={} ack_req={} pan_comp={} ver={} dst_mode={} src_mode={}",
+        fcf.frame_type,
         seq,
-        security_enabled,
-        ack_request,
-        pan_compression,
-        frame_version,
-        dst_mode,
-        src_mode
+        fcf.security_enabled,
+        fcf.frame_pending,
+        fcf.ack_request,
+        fcf.pan_compression,
+        fcf.frame_version,
+        fcf.dst_mode,
+        fcf.src_mode
     );
 
-    let mut i = 3;
-
-    let mut dst_pan: Option<u16> = None;
-
-    match dst_mode {
-        AddrMode::None => {}
-        AddrMode::Short => {
-            if frame.len() < i + 2 + 2 {
-                defmt::warn!("truncated dst short addr");
-                return;
-            }
-
-            let pan = le_u16(&frame[i..i + 2]);
-            i += 2;
-
-            let addr = le_u16(&frame[i..i + 2]);
-            i += 2;
-
-            dst_pan = Some(pan);
-
-            defmt::info!("dst_pan={=u16:04x} dst_short={=u16:04x}", pan, addr);
+    let dst_pan = match parse_dst_addr(&mut c, fcf.dst_mode) {
+        Some(v) => v,
+        None => {
+            defmt::warn!("failed parsing dst addr");
+            return;
         }
-        AddrMode::Extended => {
-            if frame.len() < i + 2 + 8 {
-                defmt::warn!("truncated dst ext addr");
-                return;
-            }
+    };
 
-            let pan = le_u16(&frame[i..i + 2]);
-            i += 2;
-
-            let addr = le_u64(&frame[i..i + 8]);
-            i += 8;
-
-            dst_pan = Some(pan);
-
-            defmt::info!("dst_pan={=u16:04x} dst_ext={=u64:016x}", pan, addr);
-        }
-        AddrMode::Reserved => {
-            defmt::warn!("reserved dst addr mode");
+    if let Some(pan) = dst_pan {
+        if pan != PAN_ID {
+            defmt::debug!("ignore other PAN={=u16:04x}", pan);
             return;
         }
     }
 
-    match src_mode {
-        AddrMode::None => {}
-        AddrMode::Short => {
-            if !pan_compression {
-                if frame.len() < i + 2 {
-                    defmt::warn!("truncated src pan");
-                    return;
-                }
+    if parse_src_addr(&mut c, fcf.src_mode, fcf.pan_compression, dst_pan).is_none() {
+        defmt::warn!("failed parsing src addr");
+        return;
+    }
 
-                let src_pan = le_u16(&frame[i..i + 2]);
-                i += 2;
-
-                defmt::info!("src_pan={=u16:04x}", src_pan);
-            } else if let Some(pan) = dst_pan {
-                defmt::info!("src_pan compressed={=u16:04x}", pan);
-            }
-
-            if frame.len() < i + 2 {
-                defmt::warn!("truncated src short addr");
-                return;
-            }
-
-            let addr = le_u16(&frame[i..i + 2]);
-            i += 2;
-
-            defmt::info!("src_short={=u16:04x}", addr);
-        }
-        AddrMode::Extended => {
-            if !pan_compression {
-                if frame.len() < i + 2 {
-                    defmt::warn!("truncated src pan");
-                    return;
-                }
-
-                let src_pan = le_u16(&frame[i..i + 2]);
-                i += 2;
-
-                defmt::info!("src_pan={=u16:04x}", src_pan);
-            } else if let Some(pan) = dst_pan {
-                defmt::info!("src_pan compressed={=u16:04x}", pan);
-            }
-
-            if frame.len() < i + 8 {
-                defmt::warn!("truncated src ext addr");
-                return;
-            }
-
-            let addr = le_u64(&frame[i..i + 8]);
-            i += 8;
-
-            defmt::info!("src_ext={=u64:016x}", addr);
-        }
-        AddrMode::Reserved => {
-            defmt::warn!("reserved src addr mode");
+    if fcf.security_enabled {
+        if parse_security_header(&mut c).is_none() {
+            defmt::warn!("failed parsing security header");
             return;
         }
     }
 
-    defmt::info!(
-        "header_len={} payload_len={}",
-        i,
-        frame.len().saturating_sub(i)
-    );
+    defmt::info!("header_len={} remaining_len={}", c.pos(), c.remaining());
 }
