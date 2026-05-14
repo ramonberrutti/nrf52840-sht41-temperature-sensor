@@ -27,7 +27,8 @@ static TWIM_BUFFER: StaticCell<[u8; 16]> = StaticCell::new();
 
 const CHANNEL: u8 = 15;
 const PAN_ID: u16 = 0x06e6;
-const EXT_PAN_ID: u64 = 0x297c_f951_98ae_4f6c;
+
+static mut TX_SEQ: u8 = 0;
 
 #[derive(Debug)]
 pub enum Sht41Error<E> {
@@ -153,6 +154,8 @@ async fn main(spawner: Spawner) {
     let mut rx_ok: u32 = 0;
     let mut rx_err: u32 = 0;
 
+    let mut beacon_timer: u32 = 0;
+
     loop {
         let mut packet = Packet::new();
 
@@ -171,6 +174,11 @@ async fn main(spawner: Spawner) {
                 );
                 decode_802154(frame);
                 defmt::debug!("raw={:02x}", frame);
+
+                beacon_timer += 1;
+                if beacon_timer % 50 == 0 {
+                    send_beacon_request(&mut radio).await;
+                }
             }
             Err(_) => {
                 rx_err = rx_err.wrapping_add(1);
@@ -196,6 +204,36 @@ async fn temperature_measurement(mut sht41: Sht41<Twim<'static>>) -> ! {
         }
 
         Timer::after(Duration::from_secs(10)).await;
+    }
+}
+
+async fn send_beacon_request(radio: &mut Radio<'_>) {
+    let seq = unsafe {
+        TX_SEQ = TX_SEQ.wrapping_add(1);
+        TX_SEQ
+    };
+
+    let mut tx = Packet::new();
+
+    let frame = [
+        0x03, 0x08, // FCF = MAC Command
+        seq,  // sequence
+        0xff, 0xff, // broadcast PAN
+        0xff, 0xff, // broadcast short addr
+        0x07, // MAC command = Beacon Request
+    ];
+
+    tx.copy_from_slice(&frame);
+
+    defmt::info!("TX Beacon Request seq={}", seq);
+
+    match radio.try_send(&mut tx).await {
+        Ok(_) => {
+            defmt::info!("Beacon Request sent");
+        }
+        Err(_) => {
+            defmt::warn!("Beacon Request TX failed");
+        }
     }
 }
 
