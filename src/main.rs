@@ -11,7 +11,7 @@ use embassy_nrf::{
     peripherals,
     twim::{self, Twim},
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_async::i2c::I2c;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -27,8 +27,38 @@ static TWIM_BUFFER: StaticCell<[u8; 16]> = StaticCell::new();
 
 const CHANNEL: u8 = 15;
 const PAN_ID: u16 = 0x06e6;
+const MAX_ROUTERS: usize = 8;
+const MAX_SHORT_DEVICES: usize = 16;
 
 static mut TX_SEQ: u8 = 0;
+
+#[derive(Clone, Copy)]
+struct SeenRouter {
+    ext_addr: u64,
+    pan_id: u16,
+    last_lqi: u8,
+    count: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SeenShortDevice {
+    short_addr: u16,
+    pan_id: u16,
+    last_lqi: u8,
+    count: u32,
+}
+
+fn rloc16_child_id(addr: u16) -> u16 {
+    addr & 0x003f
+}
+
+fn rloc16_parent(addr: u16) -> u16 {
+    addr & 0xffc0
+}
+
+fn rloc16_is_router(addr: u16) -> bool {
+    rloc16_child_id(addr) == 0
+}
 
 #[derive(Debug)]
 pub enum Sht41Error<E> {
@@ -153,8 +183,11 @@ async fn main(spawner: Spawner) {
 
     let mut rx_ok: u32 = 0;
     let mut rx_err: u32 = 0;
+    let mut routers: [Option<SeenRouter>; MAX_ROUTERS] = [None; MAX_ROUTERS];
+    let mut short_devices: [Option<SeenShortDevice>; MAX_SHORT_DEVICES] = [None; MAX_SHORT_DEVICES];
 
     let mut beacon_timer: u32 = 0;
+    let mut last_router_table_print = Instant::now();
 
     loop {
         let mut packet = Packet::new();
@@ -172,12 +205,18 @@ async fn main(spawner: Spawner) {
                     frame.len(),
                     packet.lqi()
                 );
-                decode_802154(frame);
+                decode_802154(frame, packet.lqi(), &mut routers, &mut short_devices);
                 defmt::debug!("raw={:02x}", frame);
 
                 beacon_timer += 1;
                 if beacon_timer % 50 == 0 {
                     send_beacon_request(&mut radio).await;
+                }
+
+                if last_router_table_print.elapsed() >= Duration::from_secs(5) {
+                    print_router_table(&routers);
+                    print_short_device_table(&short_devices);
+                    last_router_table_print = Instant::now();
                 }
             }
             Err(_) => {
@@ -237,6 +276,157 @@ async fn send_beacon_request(radio: &mut Radio<'_>) {
     }
 }
 
+fn remember_router(
+    routers: &mut [Option<SeenRouter>; MAX_ROUTERS],
+    ext_addr: u64,
+    pan_id: u16,
+    lqi: u8,
+) {
+    for slot in routers.iter_mut() {
+        if let Some(router) = slot {
+            if router.ext_addr == ext_addr {
+                router.last_lqi = lqi;
+                router.count = router.count.wrapping_add(1);
+
+                defmt::info!(
+                    "ROUTER update ext={=u64:016x} pan={=u16:04x} lqi={} count={}",
+                    router.ext_addr,
+                    router.pan_id,
+                    router.last_lqi,
+                    router.count
+                );
+                return;
+            }
+        }
+    }
+
+    for slot in routers.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(SeenRouter {
+                ext_addr,
+                pan_id,
+                last_lqi: lqi,
+                count: 1,
+            });
+
+            defmt::info!(
+                "ROUTER new ext={=u64:016x} pan={=u16:04x} lqi={} count=1",
+                ext_addr,
+                pan_id,
+                lqi
+            );
+            return;
+        }
+    }
+
+    defmt::warn!("router table full");
+}
+
+fn remember_short_device(
+    short_devices: &mut [Option<SeenShortDevice>; MAX_SHORT_DEVICES],
+    short_addr: u16,
+    pan_id: u16,
+    lqi: u8,
+) {
+    for slot in short_devices.iter_mut() {
+        if let Some(device) = slot {
+            if device.short_addr == short_addr {
+                device.last_lqi = lqi;
+                device.count = device.count.wrapping_add(1);
+
+                defmt::info!(
+                    "SHORT update addr={=u16:04x} pan={=u16:04x} lqi={} count={}",
+                    device.short_addr,
+                    device.pan_id,
+                    device.last_lqi,
+                    device.count
+                );
+                return;
+            }
+        }
+    }
+
+    for slot in short_devices.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(SeenShortDevice {
+                short_addr,
+                pan_id,
+                last_lqi: lqi,
+                count: 1,
+            });
+
+            defmt::info!(
+                "SHORT new addr={=u16:04x} pan={=u16:04x} lqi={} count=1",
+                short_addr,
+                pan_id,
+                lqi
+            );
+            return;
+        }
+    }
+
+    defmt::warn!("short device table full");
+}
+
+fn print_router_table(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
+    defmt::info!("=== Thread routers on PAN {=u16:04x} ===", PAN_ID);
+
+    let mut seen = 0u8;
+
+    for router in routers.iter().flatten() {
+        seen = seen.wrapping_add(1);
+
+        defmt::info!(
+            "router {} ext={=u64:016x} pan={=u16:04x} lqi={} count={}",
+            seen,
+            router.ext_addr,
+            router.pan_id,
+            router.last_lqi,
+            router.count
+        );
+    }
+
+    if seen == 0 {
+        defmt::info!("no routers seen yet");
+    }
+}
+
+fn print_short_device_table(short_devices: &[Option<SeenShortDevice>; MAX_SHORT_DEVICES]) {
+    defmt::info!("=== Short addresses on PAN {=u16:04x} ===", PAN_ID);
+
+    let mut seen = 0u8;
+
+    for device in short_devices.iter().flatten() {
+        seen = seen.wrapping_add(1);
+
+        if rloc16_is_router(device.short_addr) {
+            defmt::info!(
+                "short {} addr={=u16:04x} role=router pan={=u16:04x} lqi={} count={}",
+                seen,
+                device.short_addr,
+                device.pan_id,
+                device.last_lqi,
+                device.count
+            );
+        } else {
+            defmt::info!(
+                "short {} addr={=u16:04x} role=child parent={=u16:04x} child_id={} pan={=u16:04x} lqi={} count={}",
+                seen,
+                device.short_addr,
+                rloc16_parent(device.short_addr),
+                rloc16_child_id(device.short_addr),
+                device.pan_id,
+                device.last_lqi,
+                device.count
+            );
+        }
+    }
+
+    if seen == 0 {
+        defmt::info!("no short addresses seen yet");
+    }
+}
+
 #[derive(Clone, Copy, defmt::Format)]
 enum FrameType {
     Beacon,
@@ -250,6 +440,10 @@ impl FrameType {
     fn is_ack(self) -> bool {
         matches!(self, FrameType::Ack)
     }
+
+    fn is_beacon(self) -> bool {
+        matches!(self, FrameType::Beacon)
+    }
 }
 
 #[derive(Clone, Copy, defmt::Format)]
@@ -258,6 +452,13 @@ enum AddrMode {
     Short,
     Extended,
     Reserved,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedSrcAddr {
+    pan_id: Option<u16>,
+    short_addr: Option<u16>,
+    ext_addr: Option<u64>,
 }
 
 struct Cursor<'a> {
@@ -404,36 +605,56 @@ fn parse_src_addr(
     mode: AddrMode,
     pan_compression: bool,
     dst_pan: Option<u16>,
-) -> Option<()> {
+) -> Option<ParsedSrcAddr> {
     match mode {
-        AddrMode::None => Some(()),
+        AddrMode::None => Some(ParsedSrcAddr {
+            pan_id: None,
+            short_addr: None,
+            ext_addr: None,
+        }),
 
         AddrMode::Short => {
-            if !pan_compression {
+            let pan_id = if !pan_compression {
                 let src_pan = c.u16_le()?;
                 defmt::info!("src_pan={=u16:04x}", src_pan);
+                Some(src_pan)
             } else if let Some(pan) = dst_pan {
                 defmt::info!("src_pan compressed={=u16:04x}", pan);
-            }
+                Some(pan)
+            } else {
+                None
+            };
 
             let addr = c.u16_le()?;
             defmt::info!("src_short={=u16:04x}", addr);
 
-            Some(())
+            Some(ParsedSrcAddr {
+                pan_id,
+                short_addr: Some(addr),
+                ext_addr: None,
+            })
         }
 
         AddrMode::Extended => {
-            if !pan_compression {
+            let pan_id = if !pan_compression {
                 let src_pan = c.u16_le()?;
                 defmt::info!("src_pan={=u16:04x}", src_pan);
+                Some(src_pan)
             } else if let Some(pan) = dst_pan {
                 defmt::info!("src_pan compressed={=u16:04x}", pan);
-            }
+                Some(pan)
+            } else {
+                None
+            };
 
             let addr = c.u64_le()?;
             defmt::info!("src_ext={=u64:016x}", addr);
 
-            Some(())
+            Some(ParsedSrcAddr {
+                pan_id,
+                short_addr: None,
+                ext_addr: Some(addr),
+            })
         }
 
         AddrMode::Reserved => {
@@ -501,7 +722,12 @@ fn parse_security_header(c: &mut Cursor) -> Option<()> {
     Some(())
 }
 
-fn decode_802154(frame: &[u8]) {
+fn decode_802154(
+    frame: &[u8],
+    lqi: u8,
+    routers: &mut [Option<SeenRouter>; MAX_ROUTERS],
+    short_devices: &mut [Option<SeenShortDevice>; MAX_SHORT_DEVICES],
+) {
     let mut c = Cursor::new(frame);
 
     let fcf_raw = match c.u16_le() {
@@ -555,9 +781,26 @@ fn decode_802154(frame: &[u8]) {
         }
     }
 
-    if parse_src_addr(&mut c, fcf.src_mode, fcf.pan_compression, dst_pan).is_none() {
-        defmt::warn!("failed parsing src addr");
-        return;
+    let src = match parse_src_addr(&mut c, fcf.src_mode, fcf.pan_compression, dst_pan) {
+        Some(v) => v,
+        None => {
+            defmt::warn!("failed parsing src addr");
+            return;
+        }
+    };
+
+    if fcf.frame_type.is_beacon() {
+        if let (Some(pan_id), Some(ext_addr)) = (src.pan_id, src.ext_addr) {
+            if pan_id == PAN_ID {
+                remember_router(routers, ext_addr, pan_id, lqi);
+            }
+        }
+    }
+
+    if let (Some(pan_id), Some(short_addr)) = (src.pan_id, src.short_addr) {
+        if pan_id == PAN_ID {
+            remember_short_device(short_devices, short_addr, pan_id, lqi);
+        }
     }
 
     if fcf.security_enabled {
