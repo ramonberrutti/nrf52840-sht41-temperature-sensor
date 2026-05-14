@@ -25,10 +25,12 @@ const SHT41_ADDR: u8 = 0x44;
 const CMD_MEASURE_HIGH_PRECISION: u8 = 0xFD;
 static TWIM_BUFFER: StaticCell<[u8; 16]> = StaticCell::new();
 
-const CHANNEL: u8 = 15;
-const PAN_ID: u16 = 0x06e6;
+const DEFAULT_CHANNEL: u8 = 15;
+const DEFAULT_PAN_ID: u16 = 0x06e6;
 const MAX_ROUTERS: usize = 8;
 const MAX_SHORT_DEVICES: usize = 16;
+const THREAD_DATASET_HEX: Option<&str> = option_env!("THREAD_DATASET");
+const MAX_NETWORK_NAME_LEN: usize = 32;
 
 static mut TX_SEQ: u8 = 0;
 
@@ -61,6 +63,233 @@ struct MacSecurityHeader {
     key_id_mode: u8,
     frame_counter: Option<u32>,
     key_index: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveDataset {
+    channel: Option<u8>,
+    pan_id: Option<u16>,
+    ext_pan_id: Option<[u8; 8]>,
+    network_key: Option<[u8; 16]>,
+    network_name: NetworkName,
+}
+
+#[derive(Clone, Copy)]
+struct NetworkName {
+    bytes: [u8; MAX_NETWORK_NAME_LEN],
+    len: usize,
+}
+
+impl NetworkName {
+    const fn empty() -> Self {
+        Self {
+            bytes: [0; MAX_NETWORK_NAME_LEN],
+            len: 0,
+        }
+    }
+}
+
+fn parse_thread_dataset_from_env() -> ActiveDataset {
+    let mut dataset = ActiveDataset {
+        channel: None,
+        pan_id: None,
+        ext_pan_id: None,
+        network_key: None,
+        network_name: NetworkName::empty(),
+    };
+
+    let Some(hex) = THREAD_DATASET_HEX else {
+        defmt::warn!("THREAD_DATASET not set; using default channel/PAN for sniffing only");
+        return dataset;
+    };
+
+    defmt::info!("THREAD_DATASET provided, hex_len={}", hex.len());
+
+    let bytes = hex.as_bytes();
+    let mut i = 0usize;
+
+    while i + 4 <= bytes.len() {
+        let Some(tlv_type) = parse_hex_u8(bytes, i) else {
+            defmt::warn!("dataset parse failed reading TLV type at hex offset={}", i);
+            return dataset;
+        };
+        i += 2;
+
+        let Some(tlv_len) = parse_hex_u8(bytes, i) else {
+            defmt::warn!("dataset parse failed reading TLV len at hex offset={}", i);
+            return dataset;
+        };
+        i += 2;
+
+        let value_hex_len = (tlv_len as usize) * 2;
+        if i + value_hex_len > bytes.len() {
+            defmt::warn!(
+                "dataset TLV truncated type={=u8:02x} len={} remaining_hex={}",
+                tlv_type,
+                tlv_len,
+                bytes.len().saturating_sub(i)
+            );
+            return dataset;
+        }
+
+        parse_dataset_tlv(&mut dataset, tlv_type, tlv_len as usize, bytes, i);
+        i += value_hex_len;
+    }
+
+    if i != bytes.len() {
+        defmt::warn!("dataset trailing odd hex chars={}", bytes.len() - i);
+    }
+
+    dataset
+}
+
+fn parse_dataset_tlv(
+    dataset: &mut ActiveDataset,
+    tlv_type: u8,
+    tlv_len: usize,
+    hex: &[u8],
+    value_start: usize,
+) {
+    match tlv_type {
+        // Channel TLV: channel page u8 + channel u16 BE
+        0x00 => {
+            if tlv_len == 3 {
+                if let (Some(_page), Some(ch)) = (
+                    parse_hex_u8(hex, value_start),
+                    parse_hex_u16_be(hex, value_start + 2),
+                ) {
+                    dataset.channel = Some(ch as u8);
+                    defmt::info!("dataset channel={}", ch);
+                }
+            }
+        }
+
+        // PAN ID TLV: u16 BE
+        0x01 => {
+            if tlv_len == 2 {
+                if let Some(pan) = parse_hex_u16_be(hex, value_start) {
+                    dataset.pan_id = Some(pan);
+                    defmt::info!("dataset pan_id={=u16:04x}", pan);
+                }
+            }
+        }
+
+        // Extended PAN ID TLV: 8 bytes
+        0x02 => {
+            if tlv_len == 8 {
+                let mut out = [0u8; 8];
+                if parse_hex_array(hex, value_start, &mut out) {
+                    dataset.ext_pan_id = Some(out);
+                    defmt::info!("dataset ext_pan_id={:02x}", out);
+                }
+            }
+        }
+
+        // Network Name TLV: UTF-8-ish bytes
+        0x03 => {
+            let copy_len = tlv_len.min(MAX_NETWORK_NAME_LEN);
+            let mut name = NetworkName::empty();
+
+            for n in 0..copy_len {
+                if let Some(b) = parse_hex_u8(hex, value_start + n * 2) {
+                    name.bytes[n] = b;
+                    name.len += 1;
+                }
+            }
+
+            dataset.network_name = name;
+            defmt::info!("dataset network_name_len={}", name.len);
+        }
+
+        // Network Key TLV: 16 bytes
+        0x05 => {
+            if tlv_len == 16 {
+                let mut out = [0u8; 16];
+                if parse_hex_array(hex, value_start, &mut out) {
+                    dataset.network_key = Some(out);
+                    defmt::info!("dataset network_key=present");
+                }
+            }
+        }
+
+        _ => {
+            defmt::debug!("dataset TLV type={=u8:02x} len={}", tlv_type, tlv_len);
+        }
+    }
+}
+
+fn parse_hex_array(hex: &[u8], value_start: usize, out: &mut [u8]) -> bool {
+    for i in 0..out.len() {
+        let Some(b) = parse_hex_u8(hex, value_start + i * 2) else {
+            return false;
+        };
+        out[i] = b;
+    }
+
+    true
+}
+
+fn parse_hex_u16_be(hex: &[u8], offset: usize) -> Option<u16> {
+    let hi = parse_hex_u8(hex, offset)?;
+    let lo = parse_hex_u8(hex, offset + 2)?;
+    Some(u16::from_be_bytes([hi, lo]))
+}
+
+fn parse_hex_u8(hex: &[u8], offset: usize) -> Option<u8> {
+    if offset + 2 > hex.len() {
+        return None;
+    }
+
+    let hi = hex_nibble(hex[offset])?;
+    let lo = hex_nibble(hex[offset + 1])?;
+
+    Some((hi << 4) | lo)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn log_active_dataset(dataset: &ActiveDataset) {
+    defmt::info!("=== Thread Active Dataset ===");
+
+    if let Some(channel) = dataset.channel {
+        defmt::info!("channel={}", channel);
+    } else {
+        defmt::warn!("channel missing; using default {}", DEFAULT_CHANNEL);
+    }
+
+    if let Some(pan_id) = dataset.pan_id {
+        defmt::info!("pan_id={=u16:04x}", pan_id);
+    } else {
+        defmt::warn!("pan_id missing; using default {=u16:04x}", DEFAULT_PAN_ID);
+    }
+
+    if let Some(ext_pan_id) = dataset.ext_pan_id {
+        defmt::info!("ext_pan_id={:02x}", ext_pan_id);
+    } else {
+        defmt::warn!("ext_pan_id missing");
+    }
+
+    if dataset.network_name.len > 0 {
+        defmt::info!(
+            "network_name_bytes={:02x}",
+            &dataset.network_name.bytes[..dataset.network_name.len]
+        );
+    } else {
+        defmt::warn!("network_name missing");
+    }
+
+    if dataset.network_key.is_some() {
+        defmt::info!("network_key=present");
+    } else {
+        defmt::warn!("network_key missing; cannot join yet");
+    }
 }
 
 // Fill this manually from `ot-cli router table` / `child table` while learning.
@@ -209,7 +438,10 @@ async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(config);
 
     let mut radio = Radio::new(p.RADIO, Irqs);
-    radio.set_channel(CHANNEL);
+    let active_dataset = parse_thread_dataset_from_env();
+    log_active_dataset(&active_dataset);
+
+    radio.set_channel(active_dataset.channel.unwrap_or(DEFAULT_CHANNEL));
 
     // Change these pins to match your board.
     let sda = p.P0_20;
@@ -416,7 +648,7 @@ fn remember_short_device(
 }
 
 fn print_router_table(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
-    defmt::info!("=== Thread routers on PAN {=u16:04x} ===", PAN_ID);
+    defmt::info!("=== Thread routers on PAN {=u16:04x} ===", DEFAULT_PAN_ID);
 
     let mut seen = 0u8;
 
@@ -439,7 +671,7 @@ fn print_router_table(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
 }
 
 fn print_short_device_table(short_devices: &[Option<SeenShortDevice>; MAX_SHORT_DEVICES]) {
-    defmt::info!("=== Short addresses on PAN {=u16:04x} ===", PAN_ID);
+    defmt::info!("=== Short addresses on PAN {=u16:04x} ===", DEFAULT_PAN_ID);
 
     let mut seen = 0u8;
 
@@ -1094,7 +1326,7 @@ fn decode_802154(
     };
 
     if let Some(pan) = dst_pan {
-        if pan != PAN_ID {
+        if pan != DEFAULT_PAN_ID {
             defmt::debug!("ignore other PAN={=u16:04x}", pan);
             return;
         }
@@ -1110,14 +1342,14 @@ fn decode_802154(
 
     if fcf.frame_type.is_beacon() {
         if let (Some(pan_id), Some(ext_addr)) = (src.pan_id, src.ext_addr) {
-            if pan_id == PAN_ID {
+            if pan_id == DEFAULT_PAN_ID {
                 remember_router(routers, ext_addr, pan_id, lqi);
             }
         }
     }
 
     if let (Some(pan_id), Some(short_addr)) = (src.pan_id, src.short_addr) {
-        if pan_id == PAN_ID {
+        if pan_id == DEFAULT_PAN_ID {
             remember_short_device(short_devices, short_addr, pan_id, lqi);
         }
     }
