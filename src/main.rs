@@ -994,14 +994,13 @@ fn decode_mle_candidate(after_mlml: &[u8]) {
         return;
     }
 
-    defmt::info!("MLE: candidate len={}", after_mlml.len());
+    let preview_len = after_mlml.len().min(32);
 
-    // We are still learning the exact compressed UDP/MLE boundary.
-    // For now, print the first bytes in a structured way and scan for plausible TLVs.
-    let preview_len = after_mlml.len().min(24);
+    defmt::info!("MLE: protected/opaque candidate len={}", after_mlml.len());
     defmt::info!("MLE: bytes_after_mlml={:02x}", &after_mlml[..preview_len]);
-
-    scan_for_mle_tlvs(after_mlml);
+    defmt::info!(
+        "MLE: not decoding TLVs yet; bytes after MLML appear protected or require proper MLE parsing"
+    );
 }
 
 fn mle_tlv_name(t: u8) -> &'static str {
@@ -1039,76 +1038,6 @@ fn mle_tlv_name(t: u8) -> &'static str {
         30 => "Unknown-30",
         31 => "Unknown-31",
         _ => "Unknown",
-    }
-}
-
-fn scan_for_mle_tlvs(bytes: &[u8]) {
-    // MLE TLVs are type-length-value, but the bytes immediately after MLML may include
-    // MLE security / command fields first. Try a few offsets and report plausible TLV runs.
-    for start in 0..bytes.len().min(12) {
-        let mut i = start;
-        let mut count = 0u8;
-
-        while i + 2 <= bytes.len() {
-            let tlv_type = bytes[i];
-            let tlv_len = bytes[i + 1] as usize;
-            let value_start = i + 2;
-            let value_end = value_start + tlv_len;
-
-            if value_end > bytes.len() {
-                break;
-            }
-
-            // Avoid reporting very unlikely runs caused by random encrypted/application bytes.
-            if tlv_type > 31 && count == 0 {
-                break;
-            }
-
-            count = count.wrapping_add(1);
-            i = value_end;
-
-            if count >= 2 {
-                defmt::info!("MLE: plausible TLV run starts at offset={}", start);
-                decode_mle_tlvs_from(bytes, start);
-                return;
-            }
-        }
-    }
-
-    defmt::info!("MLE: no obvious TLV run found yet");
-}
-
-fn decode_mle_tlvs_from(bytes: &[u8], start: usize) {
-    let mut i = start;
-
-    while i + 2 <= bytes.len() {
-        let tlv_type = bytes[i];
-        let tlv_len = bytes[i + 1] as usize;
-        let value_start = i + 2;
-        let value_end = value_start + tlv_len;
-
-        if value_end > bytes.len() {
-            defmt::warn!(
-                "MLE TLV truncated type={} len={} remaining={}",
-                tlv_type,
-                tlv_len,
-                bytes.len().saturating_sub(value_start)
-            );
-            return;
-        }
-
-        let value = &bytes[value_start..value_end];
-        let preview_len = value.len().min(12);
-
-        defmt::info!(
-            "MLE TLV type={} name={} len={} value_preview={:02x}",
-            tlv_type,
-            mle_tlv_name(tlv_type),
-            tlv_len,
-            &value[..preview_len]
-        );
-
-        i = value_end;
     }
 }
 
