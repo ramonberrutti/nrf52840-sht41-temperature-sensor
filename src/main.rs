@@ -17,7 +17,7 @@ use embassy_nrf::{
     peripherals,
     twim::{self, Twim},
 };
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_hal_async::i2c::I2c;
 use heapless::Vec;
 use hmac::{Hmac, Mac};
@@ -37,78 +37,39 @@ static TWIM_BUFFER: StaticCell<[u8; 16]> = StaticCell::new();
 const DEFAULT_CHANNEL: u8 = 15;
 const DEFAULT_PAN_ID: u16 = 0x06e6;
 const MAX_ROUTERS: usize = 8;
-const MAX_SHORT_DEVICES: usize = 16;
-const THREAD_DATASET_HEX: Option<&str> = option_env!("THREAD_DATASET");
 const MAX_NETWORK_NAME_LEN: usize = 32;
+const THREAD_DATASET_HEX: Option<&str> = option_env!("THREAD_DATASET");
 
-static mut TX_SEQ: u8 = 0;
-
-const INITIAL_KEY_SEQUENCE: u32 = 0;
 const LOCAL_EXT_ADDR: u64 = 0x0200_0000_0000_0001;
-const LOCAL_FRAME_COUNTER_START: u32 = 1;
+const LOCAL_MLE_FRAME_COUNTER_START: u32 = 1;
+const THREAD_VERSION_1_4: u16 = 5;
+const MLE_UDP_PORT: u16 = 19788;
+const MLE_SECURITY_SUITE_154: u8 = 0x00;
+const MLE_SECURITY_CONTROL: u8 = 0x0d;
+const MLE_SECURITY_HEADER_LEN: usize = 10;
+const MLE_SECURITY_TAG_LEN: usize = 4;
+const BEACON_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
+const DISCOVERY_SETTLE_TIME: Duration = Duration::from_secs(5);
+const PARENT_RESPONSE_WINDOW: Duration = Duration::from_secs(3);
+const TABLE_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const RX_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy)]
-struct SeenRouter {
-    ext_addr: u64,
-    pan_id: u16,
-    last_lqi: u8,
-    count: u32,
-}
+const MLE_CMD_PARENT_REQUEST: u8 = 9;
+const MLE_CMD_PARENT_RESPONSE: u8 = 10;
 
-#[derive(Clone, Copy)]
-struct SeenShortDevice {
-    short_addr: u16,
-    pan_id: u16,
-    last_lqi: u8,
-    count: u32,
-}
+const MLE_TLV_SOURCE_ADDRESS: u8 = 0;
+const MLE_TLV_MODE: u8 = 1;
+const MLE_TLV_CHALLENGE: u8 = 3;
+const MLE_TLV_RESPONSE: u8 = 4;
+const MLE_TLV_SCAN_MASK: u8 = 12;
+const MLE_TLV_LINK_MARGIN: u8 = 14;
+const MLE_TLV_VERSION: u8 = 16;
 
-#[derive(Clone, Copy)]
-struct ShortToExtAddr {
-    short_addr: u16,
-    ext_addr: u64,
-}
-
-#[derive(Clone, Copy)]
-struct MacSecurityHeader {
-    security_control: u8,
-    security_level: u8,
-    key_id_mode: u8,
-    frame_counter: Option<u32>,
-    key_index: Option<u8>,
-}
+const SCAN_MASK_ROUTER: u8 = 1 << 7;
+const DEVICE_MODE_MED: u8 = (1 << 3) | (1 << 0);
 
 type HmacSha256 = Hmac<Sha256>;
 type AesCcmMic4 = Ccm<Aes128, U4, U13>;
-
-#[derive(Clone, Copy)]
-struct ThreadKeyMaterial {
-    key_sequence: u32,
-    key_id: u8,
-    mle_key: [u8; 16],
-    mac_key: [u8; 16],
-}
-
-#[derive(Clone, Copy)]
-struct LocalThreadDevice {
-    ext_addr: u64,
-    frame_counter: u32,
-    seq: u8,
-    sent_mac_test: bool,
-}
-
-impl LocalThreadDevice {
-    fn next_seq(&mut self) -> u8 {
-        self.seq = self.seq.wrapping_add(1);
-        self.seq
-    }
-
-    fn next_frame_counter(&mut self) -> u32 {
-        let v = self.frame_counter;
-        self.frame_counter = self.frame_counter.wrapping_add(1);
-        v
-    }
-}
 
 #[derive(Clone, Copy)]
 struct ActiveDataset {
@@ -144,261 +105,183 @@ impl NetworkName {
     }
 }
 
-fn parse_thread_dataset_from_env() -> ActiveDataset {
-    let mut dataset = ActiveDataset {
-        channel: None,
-        pan_id: None,
-        ext_pan_id: None,
-        network_key: None,
-        network_name: NetworkName::empty(),
-    };
-
-    let Some(hex) = THREAD_DATASET_HEX else {
-        defmt::warn!("THREAD_DATASET not set; using default channel/PAN for sniffing only");
-        return dataset;
-    };
-
-    defmt::info!("THREAD_DATASET provided, hex_len={}", hex.len());
-
-    let bytes = hex.as_bytes();
-    let mut i = 0usize;
-
-    while i + 4 <= bytes.len() {
-        let Some(tlv_type) = parse_hex_u8(bytes, i) else {
-            defmt::warn!("dataset parse failed reading TLV type at hex offset={}", i);
-            return dataset;
-        };
-        i += 2;
-
-        let Some(tlv_len) = parse_hex_u8(bytes, i) else {
-            defmt::warn!("dataset parse failed reading TLV len at hex offset={}", i);
-            return dataset;
-        };
-        i += 2;
-
-        let value_hex_len = (tlv_len as usize) * 2;
-        if i + value_hex_len > bytes.len() {
-            defmt::warn!(
-                "dataset TLV truncated type={=u8:02x} len={} remaining_hex={}",
-                tlv_type,
-                tlv_len,
-                bytes.len().saturating_sub(i)
-            );
-            return dataset;
-        }
-
-        parse_dataset_tlv(&mut dataset, tlv_type, tlv_len as usize, bytes, i);
-        i += value_hex_len;
-    }
-
-    if i != bytes.len() {
-        defmt::warn!("dataset trailing odd hex chars={}", bytes.len() - i);
-    }
-
-    dataset
+#[derive(Clone, Copy)]
+struct ThreadKeyMaterial {
+    key_sequence: u32,
+    key_id: u8,
+    mle_key: [u8; 16],
 }
 
-fn parse_dataset_tlv(
-    dataset: &mut ActiveDataset,
-    tlv_type: u8,
-    tlv_len: usize,
-    hex: &[u8],
-    value_start: usize,
-) {
-    match tlv_type {
-        // Channel TLV: channel page u8 + channel u16 BE
-        0x00 => {
-            if tlv_len == 3 {
-                if let (Some(_page), Some(ch)) = (
-                    parse_hex_u8(hex, value_start),
-                    parse_hex_u16_be(hex, value_start + 2),
-                ) {
-                    dataset.channel = Some(ch as u8);
-                    defmt::info!("dataset channel={}", ch);
-                }
-            }
-        }
+#[derive(Clone, Copy)]
+struct RouterInfo {
+    ext_addr: u64,
+    pan_id: u16,
+    last_lqi: u8,
+    beacon_count: u32,
+}
 
-        // PAN ID TLV: u16 BE
-        0x01 => {
-            if tlv_len == 2 {
-                if let Some(pan) = parse_hex_u16_be(hex, value_start) {
-                    dataset.pan_id = Some(pan);
-                    defmt::info!("dataset pan_id={=u16:04x}", pan);
-                }
-            }
-        }
+#[derive(Clone, Copy, defmt::Format)]
+struct ParentResponseInfo {
+    ext_addr: u64,
+    rloc16: Option<u16>,
+    link_margin: Option<u8>,
+    version: Option<u16>,
+    response_matches: bool,
+}
 
-        // Extended PAN ID TLV: 8 bytes
-        0x02 => {
-            if tlv_len == 8 {
-                let mut out = [0u8; 8];
-                if parse_hex_array(hex, value_start, &mut out) {
-                    dataset.ext_pan_id = Some(out);
-                    defmt::info!("dataset ext_pan_id={:02x}", out);
-                }
-            }
-        }
+#[derive(Clone, Copy)]
+struct LocalThreadDevice {
+    ext_addr: u64,
+    seq: u8,
+    mle_frame_counter: u32,
+}
 
-        // Network Name TLV: UTF-8-ish bytes
-        0x03 => {
-            let copy_len = tlv_len.min(MAX_NETWORK_NAME_LEN);
-            let mut name = NetworkName::empty();
+impl LocalThreadDevice {
+    fn next_seq(&mut self) -> u8 {
+        self.seq = self.seq.wrapping_add(1);
+        self.seq
+    }
 
-            for n in 0..copy_len {
-                if let Some(b) = parse_hex_u8(hex, value_start + n * 2) {
-                    name.bytes[n] = b;
-                    name.len += 1;
-                }
-            }
-
-            dataset.network_name = name;
-            defmt::info!("dataset network_name_len={}", name.len);
-        }
-
-        // Network Key TLV: 16 bytes
-        0x05 => {
-            if tlv_len == 16 {
-                let mut out = [0u8; 16];
-                if parse_hex_array(hex, value_start, &mut out) {
-                    dataset.network_key = Some(out);
-                    defmt::info!("dataset network_key=present");
-                }
-            }
-        }
-
-        _ => {
-            defmt::debug!("dataset TLV type={=u8:02x} len={}", tlv_type, tlv_len);
-        }
+    fn next_mle_frame_counter(&mut self) -> u32 {
+        let value = self.mle_frame_counter;
+        self.mle_frame_counter = self.mle_frame_counter.wrapping_add(1);
+        value
     }
 }
 
-fn parse_hex_array(hex: &[u8], value_start: usize, out: &mut [u8]) -> bool {
-    for i in 0..out.len() {
-        let Some(b) = parse_hex_u8(hex, value_start + i * 2) else {
-            return false;
-        };
-        out[i] = b;
-    }
-
-    true
-}
-
-fn parse_hex_u16_be(hex: &[u8], offset: usize) -> Option<u16> {
-    let hi = parse_hex_u8(hex, offset)?;
-    let lo = parse_hex_u8(hex, offset + 2)?;
-    Some(u16::from_be_bytes([hi, lo]))
-}
-
-fn parse_hex_u8(hex: &[u8], offset: usize) -> Option<u8> {
-    if offset + 2 > hex.len() {
-        return None;
-    }
-
-    let hi = hex_nibble(hex[offset])?;
-    let lo = hex_nibble(hex[offset + 1])?;
-
-    Some((hi << 4) | lo)
-}
-
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn log_active_dataset(dataset: &ActiveDataset) {
-    defmt::info!("=== Thread Active Dataset ===");
-
-    if let Some(channel) = dataset.channel {
-        defmt::info!("channel={}", channel);
-    } else {
-        defmt::warn!("channel missing; using default {}", DEFAULT_CHANNEL);
-    }
-
-    if let Some(pan_id) = dataset.pan_id {
-        defmt::info!("pan_id={=u16:04x}", pan_id);
-    } else {
-        defmt::warn!("pan_id missing; using default {=u16:04x}", DEFAULT_PAN_ID);
-    }
-
-    if let Some(ext_pan_id) = dataset.ext_pan_id {
-        defmt::info!("ext_pan_id={:02x}", ext_pan_id);
-    } else {
-        defmt::warn!("ext_pan_id missing");
-    }
-
-    if dataset.network_name.len > 0 {
-        defmt::info!(
-            "network_name_bytes={:02x}",
-            &dataset.network_name.bytes[..dataset.network_name.len]
-        );
-    } else {
-        defmt::warn!("network_name missing");
-    }
-
-    if dataset.network_key.is_some() {
-        defmt::info!("network_key=present");
-    } else {
-        defmt::warn!("network_key missing; cannot join yet");
-    }
-}
-
-// Fill this manually from `ot-cli router table` / `child table` while learning.
-// Example:
-// ShortToExtAddr { short_addr: 0x4800, ext_addr: 0x723d_c405_c217_f1c0 },
-const SHORT_TO_EXT: &[ShortToExtAddr] = &[
-    ShortToExtAddr {
-        short_addr: 0x4800,
-        ext_addr: 0x723d_c405_c217_f1c0,
+#[derive(Clone, Copy)]
+enum AttachPhase {
+    Discovering {
+        started_at: Instant,
     },
-    ShortToExtAddr {
-        short_addr: 0x9c00,
-        ext_addr: 0xfed7_66e8_f59c_7c32,
+    WaitingParentResponse {
+        challenge: [u8; 8],
+        sent_at: Instant,
+        preferred_parent: Option<u64>,
+        best_response: Option<ParentResponseInfo>,
     },
-    ShortToExtAddr {
-        short_addr: 0xa800,
-        ext_addr: 0xfe00_4145_170f_16b0,
+    ParentAccepted {
+        parent: ParentResponseInfo,
     },
-    ShortToExtAddr {
-        short_addr: 0xcc00,
-        ext_addr: 0x6257_22ce_831a_ccb4,
-    },
-];
-
-fn rloc16_child_id(addr: u16) -> u16 {
-    addr & 0x003f
 }
 
-fn rloc16_parent(addr: u16) -> u16 {
-    addr & 0xffc0
+#[derive(Clone, Copy, defmt::Format)]
+enum FrameType {
+    Beacon,
+    Data,
+    Ack,
+    MacCommand,
+    Unknown(u8),
 }
 
-fn rloc16_is_router(addr: u16) -> bool {
-    rloc16_child_id(addr) == 0
-}
-
-fn lookup_ext_addr(short_addr: u16) -> Option<u64> {
-    for mapping in SHORT_TO_EXT {
-        if mapping.short_addr == short_addr {
-            return Some(mapping.ext_addr);
-        }
+impl FrameType {
+    fn is_ack(self) -> bool {
+        matches!(self, FrameType::Ack)
     }
 
-    None
-}
-
-fn lookup_short_addr(ext_addr: u64) -> Option<u16> {
-    for mapping in SHORT_TO_EXT {
-        if mapping.ext_addr == ext_addr {
-            return Some(mapping.short_addr);
-        }
+    fn is_beacon(self) -> bool {
+        matches!(self, FrameType::Beacon)
     }
 
-    None
+    fn is_data(self) -> bool {
+        matches!(self, FrameType::Data)
+    }
+}
+
+#[derive(Clone, Copy, defmt::Format)]
+enum AddrMode {
+    None,
+    Short,
+    Extended,
+    Reserved,
+}
+
+#[derive(Clone, Copy)]
+struct ParsedSrcAddr {
+    pan_id: Option<u16>,
+    short_addr: Option<u16>,
+    ext_addr: Option<u64>,
+}
+
+struct Cursor<'a> {
+    frame: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(frame: &'a [u8]) -> Self {
+        Self { frame, i: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.frame.len().saturating_sub(self.i)
+    }
+
+    fn remaining_slice(&self) -> &'a [u8] {
+        &self.frame[self.i..]
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        if self.remaining() < 1 {
+            return None;
+        }
+        let value = self.frame[self.i];
+        self.i += 1;
+        Some(value)
+    }
+
+    fn u16_le(&mut self) -> Option<u16> {
+        if self.remaining() < 2 {
+            return None;
+        }
+        let value = u16::from_le_bytes([self.frame[self.i], self.frame[self.i + 1]]);
+        self.i += 2;
+        Some(value)
+    }
+
+    fn u16_be(&mut self) -> Option<u16> {
+        if self.remaining() < 2 {
+            return None;
+        }
+        let value = u16::from_be_bytes([self.frame[self.i], self.frame[self.i + 1]]);
+        self.i += 2;
+        Some(value)
+    }
+
+    fn u64_le(&mut self) -> Option<u64> {
+        if self.remaining() < 8 {
+            return None;
+        }
+        let value = u64::from_le_bytes([
+            self.frame[self.i],
+            self.frame[self.i + 1],
+            self.frame[self.i + 2],
+            self.frame[self.i + 3],
+            self.frame[self.i + 4],
+            self.frame[self.i + 5],
+            self.frame[self.i + 6],
+            self.frame[self.i + 7],
+        ]);
+        self.i += 8;
+        Some(value)
+    }
+
+    fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+        if self.remaining() < len {
+            return None;
+        }
+        let slice = &self.frame[self.i..self.i + len];
+        self.i += len;
+        Some(slice)
+    }
+}
+
+struct FrameControl {
+    frame_type: FrameType,
+    pan_compression: bool,
+    frame_version: u16,
+    dst_mode: AddrMode,
+    src_mode: AddrMode,
 }
 
 #[derive(Debug)]
@@ -430,29 +313,17 @@ where
                 Sht41Error::I2c(e)
             })?;
 
-        trace!("measurement command sent");
-
         Timer::after(Duration::from_millis(20)).await;
 
         let mut buf = [0u8; 6];
-
-        trace!("reading sensor data");
 
         self.i2c.read(SHT41_ADDR, &mut buf).await.map_err(|e| {
             warn!("i2c read failed");
             Sht41Error::I2c(e)
         })?;
 
-        trace!(
-            "raw bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]
-        );
-
         let temp_crc = crc8(&buf[0..2]);
         let rh_crc = crc8(&buf[3..5]);
-
-        trace!("temp crc calc={}, sensor={}", temp_crc, buf[2]);
-        trace!("rh crc calc={}, sensor={}", rh_crc, buf[5]);
 
         if temp_crc != buf[2] || rh_crc != buf[5] {
             warn!("crc mismatch");
@@ -462,35 +333,11 @@ where
         let raw_t = u16::from_be_bytes([buf[0], buf[1]]) as f32;
         let raw_rh = u16::from_be_bytes([buf[3], buf[4]]) as f32;
 
-        trace!("raw temp={}", raw_t);
-        trace!("raw humidity={}", raw_rh);
-
         let temperature_c = -45.0 + 175.0 * raw_t / 65535.0;
         let humidity_rh = -6.0 + 125.0 * raw_rh / 65535.0;
 
-        trace!("computed temp={}", temperature_c);
-        trace!("computed humidity={}", humidity_rh);
-
         Ok((temperature_c, humidity_rh.clamp(0.0, 100.0)))
     }
-}
-
-fn crc8(data: &[u8]) -> u8 {
-    let mut crc = 0xFFu8;
-
-    for &byte in data {
-        crc ^= byte;
-
-        for _ in 0..8 {
-            if crc & 0x80 != 0 {
-                crc = (crc << 1) ^ 0x31;
-            } else {
-                crc <<= 1;
-            }
-        }
-    }
-
-    crc
 }
 
 #[embassy_executor::main]
@@ -502,124 +349,142 @@ async fn main(spawner: Spawner) {
 
     let p = embassy_nrf::init(config);
 
-    let mut radio = Radio::new(p.RADIO, Irqs);
     let active_dataset = parse_thread_dataset_from_env();
     log_active_dataset(&active_dataset);
-    let thread_keys = derive_thread_key_material(&active_dataset, INITIAL_KEY_SEQUENCE);
-    if let Some(keys) = thread_keys {
-        log_thread_key_material(&keys);
-    } else {
-        defmt::warn!("Thread key material not derived; missing or invalid network key");
-    }
 
+    let Some(thread_keys) = derive_thread_key_material(&active_dataset, 0) else {
+        warn!("network key missing from dataset; cannot build MLE Parent Request");
+        defmt::panic!("Thread Active Dataset must include network key");
+    };
+    log_thread_key_material(&thread_keys);
+
+    let mut radio = Radio::new(p.RADIO, Irqs);
     radio.set_channel(active_dataset.channel_or_default());
 
-    // Keep the temperature sensor task running: later this becomes the Thread application payload.
+    info!(
+        "radio enabled on channel={} pan_id={=u16:04x}",
+        active_dataset.channel_or_default(),
+        active_dataset.pan_id_or_default()
+    );
+
     let sda = p.P0_20;
     let scl = p.P0_22;
-
     let mut twim_config = twim::Config::default();
     twim_config.frequency = twim::Frequency::K100;
-
     let twim_buffer = TWIM_BUFFER.init([0u8; 16]);
     let i2c = Twim::new(p.TWISPI0, Irqs, sda, scl, twim_config, twim_buffer);
     let sht41 = Sht41::new(i2c);
-
-    info!("Thread child attach experiment started");
-    info!("Temperature measurement task started");
-
     spawner.spawn(temperature_measurement(sht41).unwrap());
 
+    info!("Thread child attach experiment started");
+
+    let mut routers: [Option<RouterInfo>; MAX_ROUTERS] = [None; MAX_ROUTERS];
+    let mut local = LocalThreadDevice {
+        ext_addr: LOCAL_EXT_ADDR,
+        seq: 0,
+        mle_frame_counter: LOCAL_MLE_FRAME_COUNTER_START,
+    };
+    let mut attach_phase = AttachPhase::Discovering {
+        started_at: Instant::now(),
+    };
+    send_beacon_request(&mut radio).await;
+    let mut last_beacon_request = Instant::now();
+    let mut last_table_log = Instant::now();
     let mut rx_ok: u32 = 0;
     let mut rx_err: u32 = 0;
-    let mut routers: [Option<SeenRouter>; MAX_ROUTERS] = [None; MAX_ROUTERS];
-    let mut short_devices: [Option<SeenShortDevice>; MAX_SHORT_DEVICES] = [None; MAX_SHORT_DEVICES];
-    let mut local_device = LocalThreadDevice {
-        ext_addr: LOCAL_EXT_ADDR,
-        frame_counter: LOCAL_FRAME_COUNTER_START,
-        seq: 0,
-        sent_mac_test: false,
-    };
-
-    defmt::info!(
-        "local experimental Thread device ext_addr={=u64:016x} frame_counter_start={=u32}",
-        local_device.ext_addr,
-        local_device.frame_counter
-    );
-
-    let mut beacon_timer: u32 = 0;
-    let mut last_router_table_print = Instant::now();
 
     loop {
         let mut packet = Packet::new();
 
-        match radio.receive(&mut packet).await {
-            Ok(()) => {
+        match with_timeout(RX_POLL_TIMEOUT, radio.receive(&mut packet)).await {
+            Ok(Ok(())) => {
                 rx_ok = rx_ok.wrapping_add(1);
-
-                let frame: &[u8] = &packet;
-
-                defmt::info!(
-                    "RX ok={} err={} len={} lqi={}",
-                    rx_ok,
-                    rx_err,
-                    frame.len(),
-                    packet.lqi()
-                );
-                decode_802154(
-                    frame,
+                process_received_frame(
+                    &packet,
                     packet.lqi(),
                     active_dataset.pan_id_or_default(),
-                    thread_keys.as_ref(),
+                    &thread_keys,
                     &mut routers,
-                    &mut short_devices,
+                    &mut attach_phase,
                 );
-                defmt::debug!("raw={:02x}", frame);
+            }
+            Ok(Err(_)) => {
+                rx_err = rx_err.wrapping_add(1);
+            }
+            Err(_) => {}
+        }
 
-                beacon_timer += 1;
-                if beacon_timer % 50 == 0 {
-                    send_beacon_request(&mut radio).await;
-                }
+        if last_beacon_request.elapsed() >= BEACON_REQUEST_INTERVAL {
+            send_beacon_request(&mut radio).await;
+            last_beacon_request = Instant::now();
+        }
 
-                if last_router_table_print.elapsed() >= Duration::from_secs(5) {
-                    let active_pan_id = active_dataset.pan_id_or_default();
-                    print_router_table(active_pan_id, &routers);
-                    print_short_device_table(active_pan_id, &short_devices);
+        if last_table_log.elapsed() >= TABLE_LOG_INTERVAL {
+            print_router_table(active_dataset.pan_id_or_default(), &routers);
+            info!("attach phase={}", attach_phase_name(&attach_phase));
+            info!("rx_ok={} rx_err={}", rx_ok, rx_err);
+            last_table_log = Instant::now();
+        }
 
-                    if let Some(parent) = log_best_parent_candidate(&routers) {
-                        if !local_device.sent_mac_test {
-                            if let Some(keys) = thread_keys.as_ref() {
-                                if let Some(parent_short) = lookup_short_addr(parent.ext_addr) {
-                                    send_secured_mac_data_request(
-                                        &mut radio,
-                                        &active_dataset,
-                                        &mut local_device,
-                                        keys,
-                                        parent_short,
-                                    )
-                                    .await;
-                                    local_device.sent_mac_test = true;
-                                } else {
-                                    defmt::warn!(
-                                        "cannot send MAC TX test: missing short address for parent ext={=u64:016x}",
-                                        parent.ext_addr
-                                    );
-                                }
-                            } else {
-                                defmt::warn!("cannot send MAC TX test: Thread keys not derived");
-                            }
-                        }
+        match attach_phase {
+            AttachPhase::Discovering { started_at } => {
+                if started_at.elapsed() >= DISCOVERY_SETTLE_TIME {
+                    let preferred_parent = select_best_parent(&routers);
+
+                    if let Some(parent) = preferred_parent {
+                        let challenge = build_parent_request_challenge(local.next_seq());
+                        info!(
+                            "selected parent ext={=u64:016x} lqi={} beacons={}",
+                            parent.ext_addr, parent.last_lqi, parent.beacon_count
+                        );
+
+                        send_mle_parent_request(
+                            &mut radio,
+                            &active_dataset,
+                            &thread_keys,
+                            &mut local,
+                            challenge,
+                        )
+                        .await;
+
+                        attach_phase = AttachPhase::WaitingParentResponse {
+                            challenge,
+                            sent_at: Instant::now(),
+                            preferred_parent: Some(parent.ext_addr),
+                            best_response: None,
+                        };
+                    } else {
+                        info!("no routers discovered yet; continuing active scan");
                     }
-
-                    last_router_table_print = Instant::now();
                 }
             }
-            Err(_) => {
-                rx_err = rx_err.wrapping_add(1);
 
-                if rx_err % 100 == 0 {
-                    defmt::warn!("RX errors={} ok={}", rx_err, rx_ok);
+            AttachPhase::WaitingParentResponse {
+                challenge,
+                sent_at,
+                preferred_parent,
+                best_response,
+            } => {
+                if sent_at.elapsed() >= PARENT_RESPONSE_WINDOW {
+                    if let Some(parent) = best_response {
+                        info!(
+                            "parent accepted ext={=u64:016x} rloc16={=?} version={=?} link_margin={=?}",
+                            parent.ext_addr, parent.rloc16, parent.version, parent.link_margin
+                        );
+                        attach_phase = AttachPhase::ParentAccepted { parent };
+                    } else {
+                        warn!("no valid Parent Response received; retrying attach scan");
+                        attach_phase = AttachPhase::Discovering {
+                            started_at: Instant::now(),
+                        };
+                    }
+                } else {
+                    let _ = (challenge, preferred_parent);
                 }
+            }
+
+            AttachPhase::ParentAccepted { parent } => {
+                let _ = parent;
             }
         }
     }
@@ -642,110 +507,750 @@ async fn temperature_measurement(mut sht41: Sht41<Twim<'static>>) -> ! {
 }
 
 async fn send_beacon_request(radio: &mut Radio<'_>) {
-    let seq = unsafe {
-        TX_SEQ = TX_SEQ.wrapping_add(1);
-        TX_SEQ
-    };
-
     let mut tx = Packet::new();
-
+    let seq = 1u8;
     let frame = [
-        0x03, 0x08, // FCF = MAC Command
-        seq,  // sequence
-        0xff, 0xff, // broadcast PAN
-        0xff, 0xff, // broadcast short addr
-        0x07, // MAC command = Beacon Request
+        0x03, 0x08, // MAC command frame
+        seq, 0xff, 0xff, // dst PAN
+        0xff, 0xff, // broadcast short address
+        0x07, // Beacon Request
     ];
 
     tx.copy_from_slice(&frame);
 
-    defmt::info!("TX Beacon Request seq={}", seq);
-
     match radio.try_send(&mut tx).await {
-        Ok(_) => {
-            defmt::info!("Beacon Request sent");
-        }
-        Err(_) => {
-            defmt::warn!("Beacon Request TX failed");
-        }
+        Ok(_) => info!("TX Beacon Request"),
+        Err(_) => warn!("Beacon Request TX failed"),
     }
 }
 
-async fn send_secured_mac_data_request(
+async fn send_mle_parent_request(
     radio: &mut Radio<'_>,
     dataset: &ActiveDataset,
-    local: &mut LocalThreadDevice,
     keys: &ThreadKeyMaterial,
-    parent_short: u16,
+    local: &mut LocalThreadDevice,
+    challenge: [u8; 8],
 ) {
-    let pan_id = dataset.pan_id_or_default();
     let seq = local.next_seq();
-    let frame_counter = local.next_frame_counter();
-    let security_control = 0x0d;
+    let mle_frame_counter = local.next_mle_frame_counter();
 
-    // MAC Command frame, security enabled, ACK requested, PAN compression,
-    // IEEE 802.15.4-2006 frame version, dst short, src extended.
-    let fcf: u16 = 0xd86b;
-
-    let mut aad: Vec<u8, 64> = Vec::new();
-    push_u16_le(&mut aad, fcf);
-    aad.push(seq).ok();
-    push_u16_le(&mut aad, pan_id);
-    push_u16_le(&mut aad, parent_short);
-    aad.extend_from_slice(&local.ext_addr.to_le_bytes()).ok();
-    aad.push(security_control).ok();
-    aad.extend_from_slice(&frame_counter.to_le_bytes()).ok();
-    aad.push(keys.key_id).ok();
-
-    let plaintext = [0x04u8]; // MAC Command: Data Request
-
-    let mut nonce = [0u8; 13];
-    nonce[0..8].copy_from_slice(&local.ext_addr.to_be_bytes());
-    nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
-    nonce[12] = security_control;
-
-    let mut encrypted: Vec<u8, 16> = Vec::new();
-    encrypted.extend_from_slice(&plaintext).ok();
-
-    let cipher = <AesCcmMic4 as KeyInit>::new_from_slice(&keys.mac_key).unwrap();
-    let tag = match cipher.encrypt_in_place_detached((&nonce).into(), &aad, &mut encrypted) {
-        Ok(tag) => tag,
-        Err(_) => {
-            defmt::warn!("secured MAC Data Request encryption failed");
-            return;
-        }
+    let Some(mle_payload) =
+        build_mle_parent_request_payload(local.ext_addr, mle_frame_counter, keys, challenge)
+    else {
+        warn!("failed building MLE Parent Request payload");
+        return;
     };
 
-    let mut frame: Vec<u8, 128> = Vec::new();
-    frame.extend_from_slice(&aad).ok();
-    frame.extend_from_slice(&encrypted).ok();
-    frame.extend_from_slice(tag.as_slice()).ok();
+    let Some(lowpan_payload) = build_uncompressed_ipv6_udp_packet(
+        link_local_from_ext_addr(local.ext_addr),
+        link_local_all_routers(),
+        MLE_UDP_PORT,
+        MLE_UDP_PORT,
+        mle_payload.as_slice(),
+    ) else {
+        warn!("failed building IPv6 Parent Request");
+        return;
+    };
+
+    let pan_id = dataset.pan_id_or_default();
+    let fcf: u16 = 0xd861; // Data frame, PAN compression, ACK request, dst short, src extended.
+
+    let mut frame: Vec<u8, 127> = Vec::new();
+    push_u16_le(&mut frame, fcf);
+    frame.push(seq).ok();
+    push_u16_le(&mut frame, pan_id);
+    push_u16_le(&mut frame, 0xffff);
+    frame.extend_from_slice(&local.ext_addr.to_le_bytes()).ok();
+    frame.extend_from_slice(lowpan_payload.as_slice()).ok();
 
     let mut tx = Packet::new();
     tx.copy_from_slice(frame.as_slice());
 
-    defmt::info!(
-        "TX secured MAC Data Request seq={} pan={=u16:04x} dst_short={=u16:04x} src_ext={=u64:016x} frame_counter={=u32}",
-        seq,
-        pan_id,
-        parent_short,
-        local.ext_addr,
-        frame_counter
+    info!(
+        "TX MLE Parent Request seq={} mle_frame_counter={} src_ext={=u64:016x}",
+        seq, mle_frame_counter, local.ext_addr
     );
-    defmt::debug!("TX secured MAC frame={:02x}", frame.as_slice());
 
     match radio.try_send(&mut tx).await {
-        Ok(_) => defmt::info!("secured MAC Data Request sent"),
-        Err(_) => defmt::warn!("secured MAC Data Request TX failed"),
+        Ok(_) => info!("MLE Parent Request sent"),
+        Err(_) => warn!("MLE Parent Request TX failed"),
     }
 }
 
-fn push_u16_le<const N: usize>(out: &mut Vec<u8, N>, value: u16) {
-    out.extend_from_slice(&value.to_le_bytes()).ok();
+fn build_mle_parent_request_payload(
+    src_ext_addr: u64,
+    mle_frame_counter: u32,
+    keys: &ThreadKeyMaterial,
+    challenge: [u8; 8],
+) -> Option<Vec<u8, 128>> {
+    let src_addr = link_local_from_ext_addr(src_ext_addr);
+    let dst_addr = link_local_all_routers();
+
+    let mut payload: Vec<u8, 128> = Vec::new();
+    payload.push(MLE_SECURITY_SUITE_154).ok()?;
+    payload.push(MLE_SECURITY_CONTROL).ok()?;
+    payload
+        .extend_from_slice(&mle_frame_counter.to_le_bytes())
+        .ok()?;
+    payload
+        .extend_from_slice(&keys.key_sequence.to_be_bytes())
+        .ok()?;
+    payload.push(keys.key_id).ok()?;
+
+    let aad = build_mle_aad(src_addr, dst_addr, &payload[1..1 + MLE_SECURITY_HEADER_LEN])?;
+
+    let mut plaintext: Vec<u8, 64> = Vec::new();
+    plaintext.push(MLE_CMD_PARENT_REQUEST).ok()?;
+    push_tlv(&mut plaintext, MLE_TLV_MODE, &[DEVICE_MODE_MED])?;
+    push_tlv(&mut plaintext, MLE_TLV_CHALLENGE, &challenge)?;
+    push_tlv(&mut plaintext, MLE_TLV_SCAN_MASK, &[SCAN_MASK_ROUTER])?;
+    push_tlv(
+        &mut plaintext,
+        MLE_TLV_VERSION,
+        &THREAD_VERSION_1_4.to_be_bytes(),
+    )?;
+
+    let nonce = build_mle_nonce(src_ext_addr, mle_frame_counter);
+    let cipher = AesCcmMic4::new_from_slice(&keys.mle_key).ok()?;
+    let mut encrypted = plaintext;
+    let tag = cipher
+        .encrypt_in_place_detached((&nonce).into(), aad.as_slice(), &mut encrypted)
+        .ok()?;
+
+    payload.extend_from_slice(encrypted.as_slice()).ok()?;
+    payload.extend_from_slice(tag.as_slice()).ok()?;
+    Some(payload)
+}
+
+fn build_uncompressed_ipv6_udp_packet(
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    udp_payload: &[u8],
+) -> Option<Vec<u8, 128>> {
+    let udp_len = 8usize.checked_add(udp_payload.len())?;
+    let ipv6_payload_len = u16::try_from(udp_len).ok()?;
+
+    let mut packet: Vec<u8, 128> = Vec::new();
+    packet.push(0x41).ok()?; // 6LoWPAN uncompressed IPv6
+
+    packet
+        .extend_from_slice(&[
+            0x60, 0x00, 0x00, 0x00, // version + traffic class + flow label
+        ])
+        .ok()?;
+    packet
+        .extend_from_slice(&ipv6_payload_len.to_be_bytes())
+        .ok()?;
+    packet.push(17).ok()?; // UDP
+    packet.push(255).ok()?; // hop limit
+    packet.extend_from_slice(&src_addr).ok()?;
+    packet.extend_from_slice(&dst_addr).ok()?;
+
+    let mut udp_header = [0u8; 8];
+    udp_header[0..2].copy_from_slice(&src_port.to_be_bytes());
+    udp_header[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    udp_header[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+
+    let checksum = udp_checksum(src_addr, dst_addr, &udp_header, udp_payload);
+    udp_header[6..8].copy_from_slice(&checksum.to_be_bytes());
+
+    packet.extend_from_slice(&udp_header).ok()?;
+    packet.extend_from_slice(udp_payload).ok()?;
+    Some(packet)
+}
+
+fn process_received_frame(
+    packet: &Packet,
+    lqi: u8,
+    active_pan_id: u16,
+    keys: &ThreadKeyMaterial,
+    routers: &mut [Option<RouterInfo>; MAX_ROUTERS],
+    attach_phase: &mut AttachPhase,
+) {
+    let frame: &[u8] = packet;
+    let mut cursor = Cursor::new(frame);
+
+    let Some(fcf_raw) = cursor.u16_le() else {
+        warn!("short frame missing FCF");
+        return;
+    };
+    let Some(seq) = cursor.u8() else {
+        warn!("short frame missing sequence");
+        return;
+    };
+
+    let fcf = parse_fcf(fcf_raw);
+
+    if fcf.frame_type.is_ack() {
+        debug!("ACK seq={}", seq);
+        return;
+    }
+
+    debug!(
+        "802.15.4 type={} seq={} ver={} dst_mode={} src_mode={}",
+        fcf.frame_type, seq, fcf.frame_version, fcf.dst_mode, fcf.src_mode
+    );
+
+    let dst_pan = match parse_dst_addr(&mut cursor, fcf.dst_mode) {
+        Some(v) => v,
+        None => return,
+    };
+
+    if let Some(pan) = dst_pan {
+        if pan != 0xffff && pan != active_pan_id {
+            return;
+        }
+    }
+
+    let Some(src) = parse_src_addr(&mut cursor, fcf.src_mode, fcf.pan_compression, dst_pan) else {
+        return;
+    };
+
+    if fcf.frame_type.is_beacon() {
+        if let (Some(pan_id), Some(ext_addr)) = (src.pan_id, src.ext_addr) {
+            if pan_id == active_pan_id {
+                remember_router(routers, ext_addr, pan_id, lqi);
+            }
+        }
+        return;
+    }
+
+    if !fcf.frame_type.is_data() {
+        return;
+    }
+
+    decode_lowpan_payload(
+        cursor.remaining_slice(),
+        src.short_addr,
+        src.ext_addr,
+        keys,
+        attach_phase,
+    );
+}
+
+fn decode_lowpan_payload(
+    payload: &[u8],
+    mac_src_short: Option<u16>,
+    mac_src_ext: Option<u64>,
+    keys: &ThreadKeyMaterial,
+    attach_phase: &mut AttachPhase,
+) {
+    if payload.is_empty() {
+        return;
+    }
+
+    if payload[0] == 0x41 {
+        decode_uncompressed_ipv6(payload, mac_src_short, mac_src_ext, keys, attach_phase);
+        return;
+    }
+
+    if payload.len() >= 2 && (payload[0] & 0xe0) == 0x60 {
+        decode_iphc_ipv6(payload, mac_src_short, mac_src_ext, keys, attach_phase);
+        return;
+    }
+}
+
+fn decode_uncompressed_ipv6(
+    payload: &[u8],
+    mac_src_short: Option<u16>,
+    mac_src_ext: Option<u64>,
+    keys: &ThreadKeyMaterial,
+    attach_phase: &mut AttachPhase,
+) {
+    if payload.len() < 1 + 40 + 8 {
+        return;
+    }
+
+    let ipv6 = &payload[1..];
+    if ipv6[6] != 17 || ipv6[7] != 255 {
+        return;
+    }
+
+    let mut src_addr = [0u8; 16];
+    src_addr.copy_from_slice(&ipv6[8..24]);
+    let mut dst_addr = [0u8; 16];
+    dst_addr.copy_from_slice(&ipv6[24..40]);
+
+    let udp = &ipv6[40..];
+    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
+    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+    if src_port != MLE_UDP_PORT || dst_port != MLE_UDP_PORT {
+        return;
+    }
+
+    if mac_src_ext.is_none() {
+        debug!(
+            "RX MLE over uncompressed IPv6 from MAC short={=?}, IPv6 src IID={:02x}",
+            mac_src_short,
+            &src_addr[8..16]
+        );
+    }
+
+    decode_mle_message(src_addr, dst_addr, &udp[8..], keys, attach_phase);
+}
+
+fn decode_iphc_ipv6(
+    payload: &[u8],
+    mac_src_short: Option<u16>,
+    mac_src_ext: Option<u64>,
+    keys: &ThreadKeyMaterial,
+    attach_phase: &mut AttachPhase,
+) {
+    let mut cursor = Cursor::new(payload);
+    let Some(b0) = cursor.u8() else {
+        return;
+    };
+    let Some(b1) = cursor.u8() else {
+        return;
+    };
+
+    let tf = (b0 >> 3) & 0b11;
+    let nh_compressed = (b0 & (1 << 2)) != 0;
+    let hlim = b0 & 0b11;
+
+    let cid = (b1 & (1 << 7)) != 0;
+    let sac = (b1 & (1 << 6)) != 0;
+    let sam = (b1 >> 4) & 0b11;
+    let multicast = (b1 & (1 << 3)) != 0;
+    let dac = (b1 & (1 << 2)) != 0;
+    let dam = b1 & 0b11;
+
+    if cid {
+        cursor.u8();
+    }
+
+    let tf_inline_len = match tf {
+        0 => 4,
+        1 => 3,
+        2 => 1,
+        _ => 0,
+    };
+    cursor.take(tf_inline_len);
+
+    let next_header = if nh_compressed { None } else { cursor.u8() };
+
+    let hop_limit = match hlim {
+        0 => cursor.u8(),
+        1 => Some(1),
+        2 => Some(64),
+        3 => Some(255),
+        _ => None,
+    };
+
+    if hop_limit != Some(255) {
+        return;
+    }
+
+    let local_ext_addr = iid_to_ext_addr(&link_local_from_ext_addr(LOCAL_EXT_ADDR)[8..16]);
+    let Some(src_addr) =
+        decode_iphc_unicast_addr(&mut cursor, sac, sam, mac_src_short, mac_src_ext)
+    else {
+        return;
+    };
+    let dst_addr = if multicast {
+        let Some(addr) = decode_iphc_multicast_addr(&mut cursor, dam) else {
+            return;
+        };
+        addr
+    } else {
+        let Some(addr) =
+            decode_iphc_unicast_addr(&mut cursor, dac, dam, None, Some(local_ext_addr))
+        else {
+            return;
+        };
+        addr
+    };
+
+    let nh = if let Some(nh) = next_header {
+        nh
+    } else {
+        let Some(udp_ctl) = cursor.u8() else {
+            return;
+        };
+
+        if (udp_ctl & 0xf8) != 0xf0 {
+            return;
+        }
+
+        let Some((src_port, dst_port)) = decode_compressed_udp_ports(&mut cursor, udp_ctl) else {
+            return;
+        };
+
+        if (udp_ctl & 0x04) != 0 {
+            return;
+        }
+
+        let Some(_checksum) = cursor.u16_be() else {
+            return;
+        };
+        if src_port != MLE_UDP_PORT || dst_port != MLE_UDP_PORT {
+            return;
+        }
+
+        if mac_src_ext.is_none() {
+            debug!(
+                "RX MLE over IPHC from MAC short={=?}, IPv6 src IID={:02x}",
+                mac_src_short,
+                &src_addr[8..16]
+            );
+        }
+
+        decode_mle_message(
+            src_addr,
+            dst_addr,
+            cursor.remaining_slice(),
+            keys,
+            attach_phase,
+        );
+        return;
+    };
+
+    if nh != 17 {
+        return;
+    }
+
+    let Some(src_port) = cursor.u16_be() else {
+        return;
+    };
+    let Some(dst_port) = cursor.u16_be() else {
+        return;
+    };
+    let Some(_udp_len) = cursor.u16_be() else {
+        return;
+    };
+    let Some(_checksum) = cursor.u16_be() else {
+        return;
+    };
+
+    if src_port != MLE_UDP_PORT || dst_port != MLE_UDP_PORT {
+        return;
+    }
+
+    if mac_src_ext.is_none() {
+        debug!(
+            "RX inline-UDP MLE from MAC short={=?}, IPv6 src IID={:02x}",
+            mac_src_short,
+            &src_addr[8..16]
+        );
+    }
+
+    decode_mle_message(
+        src_addr,
+        dst_addr,
+        cursor.remaining_slice(),
+        keys,
+        attach_phase,
+    );
+}
+
+fn decode_mle_message(
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+    payload: &[u8],
+    keys: &ThreadKeyMaterial,
+    attach_phase: &mut AttachPhase,
+) {
+    if payload.len() < 1 + MLE_SECURITY_HEADER_LEN + 1 + MLE_SECURITY_TAG_LEN {
+        return;
+    }
+
+    if payload[0] != MLE_SECURITY_SUITE_154 {
+        return;
+    }
+
+    let security_header = &payload[1..1 + MLE_SECURITY_HEADER_LEN];
+    let security_control = security_header[0];
+    if security_control != MLE_SECURITY_CONTROL {
+        return;
+    }
+
+    let frame_counter = u32::from_le_bytes([
+        security_header[1],
+        security_header[2],
+        security_header[3],
+        security_header[4],
+    ]);
+    let key_sequence = u32::from_be_bytes([
+        security_header[5],
+        security_header[6],
+        security_header[7],
+        security_header[8],
+    ]);
+
+    if key_sequence != keys.key_sequence {
+        return;
+    }
+
+    let src_ext_addr = iid_to_ext_addr(&src_addr[8..16]);
+    let nonce = build_mle_nonce(src_ext_addr, frame_counter);
+    let Some(aad) = build_mle_aad(src_addr, dst_addr, security_header) else {
+        return;
+    };
+
+    let encrypted = &payload[1 + MLE_SECURITY_HEADER_LEN..payload.len() - MLE_SECURITY_TAG_LEN];
+    let mic = &payload[payload.len() - MLE_SECURITY_TAG_LEN..];
+
+    let mut plaintext: Vec<u8, 96> = Vec::new();
+    plaintext.extend_from_slice(encrypted).ok();
+
+    let cipher = match AesCcmMic4::new_from_slice(&keys.mle_key) {
+        Ok(cipher) => cipher,
+        Err(_) => return,
+    };
+
+    if cipher
+        .decrypt_in_place_detached((&nonce).into(), aad.as_slice(), &mut plaintext, mic.into())
+        .is_err()
+    {
+        return;
+    }
+
+    if plaintext.is_empty() {
+        return;
+    }
+
+    match plaintext[0] {
+        MLE_CMD_PARENT_RESPONSE => {
+            if let Some(response) =
+                parse_parent_response(src_ext_addr, &plaintext[1..], attach_phase)
+            {
+                info!(
+                    "RX Parent Response ext={=u64:016x} response_matches={} rloc16={=?}",
+                    response.ext_addr, response.response_matches, response.rloc16
+                );
+            }
+        }
+        MLE_CMD_PARENT_REQUEST => {
+            debug!("RX MLE Parent Request from ext={=u64:016x}", src_ext_addr);
+        }
+        cmd => {
+            debug!(
+                "RX other MLE cmd={=u8:02x} from ext={=u64:016x}",
+                cmd, src_ext_addr
+            );
+        }
+    }
+}
+
+fn parse_parent_response(
+    src_ext_addr: u64,
+    tlvs: &[u8],
+    attach_phase: &mut AttachPhase,
+) -> Option<ParentResponseInfo> {
+    let (expected_challenge, preferred_parent, current_best) = match *attach_phase {
+        AttachPhase::WaitingParentResponse {
+            challenge,
+            preferred_parent,
+            best_response,
+            ..
+        } => (challenge, preferred_parent, best_response),
+        _ => return None,
+    };
+
+    let mut cursor = Cursor::new(tlvs);
+    let mut response_matches = false;
+    let mut rloc16 = None;
+    let mut link_margin = None;
+    let mut version = None;
+
+    while cursor.remaining() >= 2 {
+        let tlv_type = cursor.u8()?;
+        let tlv_len = cursor.u8()? as usize;
+        let value = cursor.take(tlv_len)?;
+
+        match tlv_type {
+            MLE_TLV_SOURCE_ADDRESS if tlv_len == 2 => {
+                rloc16 = Some(u16::from_be_bytes([value[0], value[1]]));
+            }
+            MLE_TLV_RESPONSE if tlv_len == expected_challenge.len() => {
+                response_matches = value == expected_challenge;
+            }
+            MLE_TLV_LINK_MARGIN if tlv_len == 1 => {
+                link_margin = Some(value[0]);
+            }
+            MLE_TLV_VERSION if tlv_len == 2 => {
+                version = Some(u16::from_be_bytes([value[0], value[1]]));
+            }
+            _ => {}
+        }
+    }
+
+    let response = ParentResponseInfo {
+        ext_addr: src_ext_addr,
+        rloc16,
+        link_margin,
+        version,
+        response_matches,
+    };
+
+    if response_matches {
+        let preferred = preferred_parent == Some(src_ext_addr);
+        let better_than_current = match current_best {
+            None => true,
+            Some(current) => {
+                preferred || current.ext_addr != preferred_parent.unwrap_or(current.ext_addr)
+            }
+        };
+
+        if better_than_current {
+            if let AttachPhase::WaitingParentResponse {
+                challenge,
+                sent_at,
+                preferred_parent,
+                best_response: _,
+            } = *attach_phase
+            {
+                *attach_phase = AttachPhase::WaitingParentResponse {
+                    challenge,
+                    sent_at,
+                    preferred_parent,
+                    best_response: Some(response),
+                };
+            }
+        }
+    }
+
+    Some(response)
+}
+
+fn parse_thread_dataset_from_env() -> ActiveDataset {
+    let mut dataset = ActiveDataset {
+        channel: None,
+        pan_id: None,
+        ext_pan_id: None,
+        network_key: None,
+        network_name: NetworkName::empty(),
+    };
+
+    let Some(hex) = THREAD_DATASET_HEX else {
+        warn!("THREAD_DATASET not set; using default channel/PAN for discovery only");
+        return dataset;
+    };
+
+    let bytes = hex.as_bytes();
+    let mut i = 0usize;
+
+    while i + 4 <= bytes.len() {
+        let Some(tlv_type) = parse_hex_u8(bytes, i) else {
+            return dataset;
+        };
+        i += 2;
+
+        let Some(tlv_len) = parse_hex_u8(bytes, i) else {
+            return dataset;
+        };
+        i += 2;
+
+        let value_hex_len = (tlv_len as usize) * 2;
+        if i + value_hex_len > bytes.len() {
+            return dataset;
+        }
+
+        parse_dataset_tlv(&mut dataset, tlv_type, tlv_len as usize, bytes, i);
+        i += value_hex_len;
+    }
+
+    dataset
+}
+
+fn parse_dataset_tlv(
+    dataset: &mut ActiveDataset,
+    tlv_type: u8,
+    tlv_len: usize,
+    hex: &[u8],
+    value_start: usize,
+) {
+    match tlv_type {
+        0x00 if tlv_len == 3 => {
+            if let Some(ch) = parse_hex_u16_be(hex, value_start + 2) {
+                dataset.channel = Some(ch as u8);
+            }
+        }
+        0x01 if tlv_len == 2 => {
+            dataset.pan_id = parse_hex_u16_be(hex, value_start);
+        }
+        0x02 if tlv_len == 8 => {
+            let mut out = [0u8; 8];
+            if parse_hex_array(hex, value_start, &mut out) {
+                dataset.ext_pan_id = Some(out);
+            }
+        }
+        0x03 => {
+            let copy_len = tlv_len.min(MAX_NETWORK_NAME_LEN);
+            let mut name = NetworkName::empty();
+
+            for n in 0..copy_len {
+                if let Some(byte) = parse_hex_u8(hex, value_start + n * 2) {
+                    name.bytes[n] = byte;
+                    name.len += 1;
+                }
+            }
+
+            dataset.network_name = name;
+        }
+        0x05 if tlv_len == 16 => {
+            let mut out = [0u8; 16];
+            if parse_hex_array(hex, value_start, &mut out) {
+                dataset.network_key = Some(out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn log_active_dataset(dataset: &ActiveDataset) {
+    info!("=== Thread Active Dataset ===");
+    info!("channel={}", dataset.channel_or_default());
+    info!("pan_id={=u16:04x}", dataset.pan_id_or_default());
+
+    if let Some(ext_pan_id) = dataset.ext_pan_id {
+        info!("ext_pan_id={:02x}", ext_pan_id);
+    }
+
+    if dataset.network_name.len > 0 {
+        info!(
+            "network_name_bytes={:02x}",
+            &dataset.network_name.bytes[..dataset.network_name.len]
+        );
+    }
+
+    info!("network_key_present={}", dataset.network_key.is_some());
+}
+
+fn derive_thread_key_material(
+    dataset: &ActiveDataset,
+    key_sequence: u32,
+) -> Option<ThreadKeyMaterial> {
+    let network_key = dataset.network_key?;
+
+    let mut hmac = <HmacSha256 as Mac>::new_from_slice(&network_key).ok()?;
+    hmac.update(&key_sequence.to_be_bytes());
+    hmac.update(b"Thread");
+    let hash = hmac.finalize().into_bytes();
+
+    let mut mle_key = [0u8; 16];
+    mle_key.copy_from_slice(&hash[..16]);
+
+    Some(ThreadKeyMaterial {
+        key_sequence,
+        key_id: ((key_sequence & 0x7f) as u8).wrapping_add(1),
+        mle_key,
+    })
+}
+
+fn log_thread_key_material(keys: &ThreadKeyMaterial) {
+    info!("=== Thread Key Material ===");
+    info!(
+        "key_sequence={=u32} key_id={}",
+        keys.key_sequence, keys.key_id
+    );
+    debug!("mle_key_debug={:02x}", keys.mle_key);
 }
 
 fn remember_router(
-    routers: &mut [Option<SeenRouter>; MAX_ROUTERS],
+    routers: &mut [Option<RouterInfo>; MAX_ROUTERS],
     ext_addr: u64,
     pan_id: u16,
     lqi: u8,
@@ -754,15 +1259,7 @@ fn remember_router(
         if let Some(router) = slot {
             if router.ext_addr == ext_addr {
                 router.last_lqi = lqi;
-                router.count = router.count.wrapping_add(1);
-
-                defmt::info!(
-                    "ROUTER update ext={=u64:016x} pan={=u16:04x} lqi={} count={}",
-                    router.ext_addr,
-                    router.pan_id,
-                    router.last_lqi,
-                    router.count
-                );
+                router.beacon_count = router.beacon_count.wrapping_add(1);
                 return;
             }
         }
@@ -770,136 +1267,25 @@ fn remember_router(
 
     for slot in routers.iter_mut() {
         if slot.is_none() {
-            *slot = Some(SeenRouter {
+            *slot = Some(RouterInfo {
                 ext_addr,
                 pan_id,
                 last_lqi: lqi,
-                count: 1,
+                beacon_count: 1,
             });
-
-            defmt::info!(
-                "ROUTER new ext={=u64:016x} pan={=u16:04x} lqi={} count=1",
-                ext_addr,
-                pan_id,
-                lqi
+            info!(
+                "router discovered ext={=u64:016x} pan={=u16:04x} lqi={}",
+                ext_addr, pan_id, lqi
             );
             return;
         }
     }
 
-    defmt::warn!("router table full");
+    warn!("router table full");
 }
 
-fn remember_short_device(
-    short_devices: &mut [Option<SeenShortDevice>; MAX_SHORT_DEVICES],
-    short_addr: u16,
-    pan_id: u16,
-    lqi: u8,
-) {
-    for slot in short_devices.iter_mut() {
-        if let Some(device) = slot {
-            if device.short_addr == short_addr {
-                device.last_lqi = lqi;
-                device.count = device.count.wrapping_add(1);
-
-                defmt::info!(
-                    "SHORT update addr={=u16:04x} pan={=u16:04x} lqi={} count={}",
-                    device.short_addr,
-                    device.pan_id,
-                    device.last_lqi,
-                    device.count
-                );
-                return;
-            }
-        }
-    }
-
-    for slot in short_devices.iter_mut() {
-        if slot.is_none() {
-            *slot = Some(SeenShortDevice {
-                short_addr,
-                pan_id,
-                last_lqi: lqi,
-                count: 1,
-            });
-
-            defmt::info!(
-                "SHORT new addr={=u16:04x} pan={=u16:04x} lqi={} count=1",
-                short_addr,
-                pan_id,
-                lqi
-            );
-            return;
-        }
-    }
-
-    defmt::warn!("short device table full");
-}
-
-fn print_router_table(active_pan_id: u16, routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
-    defmt::info!("=== Thread routers on PAN {=u16:04x} ===", active_pan_id);
-
-    let mut seen = 0u8;
-
-    for router in routers.iter().flatten() {
-        seen = seen.wrapping_add(1);
-
-        defmt::info!(
-            "router {} ext={=u64:016x} pan={=u16:04x} lqi={} count={}",
-            seen,
-            router.ext_addr,
-            router.pan_id,
-            router.last_lqi,
-            router.count
-        );
-    }
-
-    if seen == 0 {
-        defmt::info!("no routers seen yet");
-    }
-}
-
-fn print_short_device_table(
-    active_pan_id: u16,
-    short_devices: &[Option<SeenShortDevice>; MAX_SHORT_DEVICES],
-) {
-    defmt::info!("=== Short addresses on PAN {=u16:04x} ===", active_pan_id);
-
-    let mut seen = 0u8;
-
-    for device in short_devices.iter().flatten() {
-        seen = seen.wrapping_add(1);
-
-        if rloc16_is_router(device.short_addr) {
-            defmt::info!(
-                "short {} addr={=u16:04x} role=router pan={=u16:04x} lqi={} count={}",
-                seen,
-                device.short_addr,
-                device.pan_id,
-                device.last_lqi,
-                device.count
-            );
-        } else {
-            defmt::info!(
-                "short {} addr={=u16:04x} role=child parent={=u16:04x} child_id={} pan={=u16:04x} lqi={} count={}",
-                seen,
-                device.short_addr,
-                rloc16_parent(device.short_addr),
-                rloc16_child_id(device.short_addr),
-                device.pan_id,
-                device.last_lqi,
-                device.count
-            );
-        }
-    }
-
-    if seen == 0 {
-        defmt::info!("no short addresses seen yet");
-    }
-}
-
-fn log_best_parent_candidate(routers: &[Option<SeenRouter>; MAX_ROUTERS]) -> Option<SeenRouter> {
-    let mut best: Option<SeenRouter> = None;
+fn select_best_parent(routers: &[Option<RouterInfo>; MAX_ROUTERS]) -> Option<RouterInfo> {
+    let mut best: Option<RouterInfo> = None;
 
     for router in routers.iter().flatten() {
         match best {
@@ -908,150 +1294,47 @@ fn log_best_parent_candidate(routers: &[Option<SeenRouter>; MAX_ROUTERS]) -> Opt
         }
     }
 
-    if let Some(router) = best {
-        defmt::info!(
-            "parent candidate ext={=u64:016x} pan={=u16:04x} lqi={} beacon_count={}",
-            router.ext_addr,
-            router.pan_id,
-            router.last_lqi,
-            router.count
+    best
+}
+
+fn print_router_table(active_pan_id: u16, routers: &[Option<RouterInfo>; MAX_ROUTERS]) {
+    info!("=== Routers on PAN {=u16:04x} ===", active_pan_id);
+
+    let mut count = 0u8;
+    for router in routers.iter().flatten() {
+        count = count.wrapping_add(1);
+        info!(
+            "router {} ext={=u64:016x} pan={=u16:04x} lqi={} beacons={}",
+            count, router.ext_addr, router.pan_id, router.last_lqi, router.beacon_count
         );
-        defmt::info!("join state: next step is secured MAC TX test toward this parent");
-        Some(router)
-    } else {
-        defmt::info!("join state: no parent candidate yet; keep scanning");
-        None
+    }
+
+    if count == 0 {
+        info!("no routers seen yet");
     }
 }
 
-#[derive(Clone, Copy, defmt::Format)]
-enum FrameType {
-    Beacon,
-    Data,
-    Ack,
-    MacCommand,
-    Unknown(u8),
-}
-
-impl FrameType {
-    fn is_ack(self) -> bool {
-        matches!(self, FrameType::Ack)
-    }
-
-    fn is_beacon(self) -> bool {
-        matches!(self, FrameType::Beacon)
+fn attach_phase_name(phase: &AttachPhase) -> &'static str {
+    match phase {
+        AttachPhase::Discovering { .. } => "discovering",
+        AttachPhase::WaitingParentResponse { .. } => "waiting-parent-response",
+        AttachPhase::ParentAccepted { .. } => "parent-accepted",
     }
 }
 
-#[derive(Clone, Copy, defmt::Format)]
-enum AddrMode {
-    None,
-    Short,
-    Extended,
-    Reserved,
-}
-
-#[derive(Clone, Copy)]
-struct ParsedSrcAddr {
-    pan_id: Option<u16>,
-    short_addr: Option<u16>,
-    ext_addr: Option<u64>,
-}
-
-impl ParsedSrcAddr {
-    fn best_known_ext_addr(&self) -> Option<u64> {
-        if let Some(ext_addr) = self.ext_addr {
-            return Some(ext_addr);
-        }
-
-        if let Some(short_addr) = self.short_addr {
-            return lookup_ext_addr(short_addr);
-        }
-
-        None
-    }
-}
-
-struct Cursor<'a> {
-    frame: &'a [u8],
-    i: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn new(frame: &'a [u8]) -> Self {
-        Self { frame, i: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.frame.len().saturating_sub(self.i)
-    }
-
-    fn pos(&self) -> usize {
-        self.i
-    }
-
-    fn remaining_slice(&self) -> &'a [u8] {
-        &self.frame[self.i..]
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        if self.remaining() < 1 {
-            return None;
-        }
-        let v = self.frame[self.i];
-        self.i += 1;
-        Some(v)
-    }
-
-    fn u16_le(&mut self) -> Option<u16> {
-        if self.remaining() < 2 {
-            return None;
-        }
-        let v = u16::from_le_bytes([self.frame[self.i], self.frame[self.i + 1]]);
-        self.i += 2;
-        Some(v)
-    }
-
-    fn u32_le(&mut self) -> Option<u32> {
-        if self.remaining() < 4 {
-            return None;
-        }
-        let v = u32::from_le_bytes([
-            self.frame[self.i],
-            self.frame[self.i + 1],
-            self.frame[self.i + 2],
-            self.frame[self.i + 3],
-        ]);
-        self.i += 4;
-        Some(v)
-    }
-
-    fn u64_le(&mut self) -> Option<u64> {
-        if self.remaining() < 8 {
-            return None;
-        }
-        let v = u64::from_le_bytes([
-            self.frame[self.i],
-            self.frame[self.i + 1],
-            self.frame[self.i + 2],
-            self.frame[self.i + 3],
-            self.frame[self.i + 4],
-            self.frame[self.i + 5],
-            self.frame[self.i + 6],
-            self.frame[self.i + 7],
-        ]);
-        self.i += 8;
-        Some(v)
-    }
-}
-
-fn parse_frame_type(fcf: u16) -> FrameType {
-    match (fcf & 0b111) as u8 {
-        0 => FrameType::Beacon,
-        1 => FrameType::Data,
-        2 => FrameType::Ack,
-        3 => FrameType::MacCommand,
-        x => FrameType::Unknown(x),
+fn parse_fcf(fcf: u16) -> FrameControl {
+    FrameControl {
+        frame_type: match (fcf & 0b111) as u8 {
+            0 => FrameType::Beacon,
+            1 => FrameType::Data,
+            2 => FrameType::Ack,
+            3 => FrameType::MacCommand,
+            other => FrameType::Unknown(other),
+        },
+        pan_compression: (fcf & (1 << 6)) != 0,
+        frame_version: (fcf >> 12) & 0b11,
+        dst_mode: parse_addr_mode((fcf >> 10) & 0b11),
+        src_mode: parse_addr_mode((fcf >> 14) & 0b11),
     }
 }
 
@@ -1064,54 +1347,20 @@ fn parse_addr_mode(bits: u16) -> AddrMode {
     }
 }
 
-struct FrameControl {
-    frame_type: FrameType,
-    security_enabled: bool,
-    frame_pending: bool,
-    ack_request: bool,
-    pan_compression: bool,
-    frame_version: u16,
-    dst_mode: AddrMode,
-    src_mode: AddrMode,
-}
-
-fn parse_fcf(fcf: u16) -> FrameControl {
-    FrameControl {
-        frame_type: parse_frame_type(fcf),
-        security_enabled: (fcf & (1 << 3)) != 0,
-        frame_pending: (fcf & (1 << 4)) != 0,
-        ack_request: (fcf & (1 << 5)) != 0,
-        pan_compression: (fcf & (1 << 6)) != 0,
-        dst_mode: parse_addr_mode((fcf >> 10) & 0b11),
-        frame_version: (fcf >> 12) & 0b11,
-        src_mode: parse_addr_mode((fcf >> 14) & 0b11),
-    }
-}
-
 fn parse_dst_addr(c: &mut Cursor, mode: AddrMode) -> Option<Option<u16>> {
     match mode {
         AddrMode::None => Some(None),
-
         AddrMode::Short => {
             let pan = c.u16_le()?;
-            let addr = c.u16_le()?;
-
-            defmt::debug!("dst_pan={=u16:04x} dst_short={=u16:04x}", pan, addr);
+            c.u16_le()?;
             Some(Some(pan))
         }
-
         AddrMode::Extended => {
             let pan = c.u16_le()?;
-            let addr = c.u64_le()?;
-
-            defmt::debug!("dst_pan={=u16:04x} dst_ext={=u64:016x}", pan, addr);
+            c.u64_le()?;
             Some(Some(pan))
         }
-
-        AddrMode::Reserved => {
-            defmt::warn!("reserved dst addr mode");
-            None
-        }
+        AddrMode::Reserved => None,
     }
 }
 
@@ -1127,614 +1376,310 @@ fn parse_src_addr(
             short_addr: None,
             ext_addr: None,
         }),
-
         AddrMode::Short => {
-            let pan_id = if !pan_compression {
-                let src_pan = c.u16_le()?;
-                defmt::debug!("src_pan={=u16:04x}", src_pan);
-                Some(src_pan)
-            } else if let Some(pan) = dst_pan {
-                defmt::debug!("src_pan compressed={=u16:04x}", pan);
-                Some(pan)
+            let pan_id = if pan_compression {
+                dst_pan
             } else {
-                None
+                Some(c.u16_le()?)
             };
-
-            let addr = c.u16_le()?;
-            defmt::debug!("src_short={=u16:04x}", addr);
-
+            let short_addr = c.u16_le()?;
             Some(ParsedSrcAddr {
                 pan_id,
-                short_addr: Some(addr),
+                short_addr: Some(short_addr),
                 ext_addr: None,
             })
         }
-
         AddrMode::Extended => {
-            let pan_id = if !pan_compression {
-                let src_pan = c.u16_le()?;
-                defmt::debug!("src_pan={=u16:04x}", src_pan);
-                Some(src_pan)
-            } else if let Some(pan) = dst_pan {
-                defmt::debug!("src_pan compressed={=u16:04x}", pan);
-                Some(pan)
+            let pan_id = if pan_compression {
+                dst_pan
             } else {
-                None
+                Some(c.u16_le()?)
             };
-
-            let addr = c.u64_le()?;
-            defmt::debug!("src_ext={=u64:016x}", addr);
-
+            let ext_addr = c.u64_le()?;
             Some(ParsedSrcAddr {
                 pan_id,
                 short_addr: None,
-                ext_addr: Some(addr),
+                ext_addr: Some(ext_addr),
             })
         }
-
-        AddrMode::Reserved => {
-            defmt::warn!("reserved src addr mode");
-            None
-        }
+        AddrMode::Reserved => None,
     }
 }
 
-fn parse_security_header(c: &mut Cursor) -> Option<MacSecurityHeader> {
-    let security_control = c.u8()?;
+fn decode_iphc_unicast_addr(
+    cursor: &mut Cursor,
+    context_compressed: bool,
+    addr_mode: u8,
+    mac_short_addr: Option<u16>,
+    mac_ext_addr: Option<u64>,
+) -> Option<[u8; 16]> {
+    if context_compressed {
+        return None;
+    }
 
-    let security_level = security_control & 0b0000_0111;
-    let key_id_mode = (security_control >> 3) & 0b11;
-    let frame_counter_suppression = (security_control & (1 << 5)) != 0;
-    let asn_in_nonce = (security_control & (1 << 6)) != 0;
-
-    defmt::debug!(
-        "security_control={=u8:02x} level={} key_id_mode={} frame_counter_suppression={} asn_in_nonce={}",
-        security_control,
-        security_level,
-        key_id_mode,
-        frame_counter_suppression,
-        asn_in_nonce
-    );
-
-    let frame_counter = if !frame_counter_suppression {
-        let frame_counter = c.u32_le()?;
-        defmt::debug!("frame_counter={=u32}", frame_counter);
-        Some(frame_counter)
-    } else {
-        None
-    };
-
-    let mut key_index = None;
-
-    match key_id_mode {
+    match addr_mode {
         0 => {
-            defmt::debug!("key_id_mode=implicit");
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(cursor.take(16)?);
+            Some(addr)
         }
-
         1 => {
-            let index = c.u8()?;
-            defmt::debug!("key_index={}", index);
-            key_index = Some(index);
+            let mut addr = [0u8; 16];
+            addr[0] = 0xfe;
+            addr[1] = 0x80;
+            addr[8..16].copy_from_slice(cursor.take(8)?);
+            Some(addr)
         }
-
         2 => {
-            let key_source = c.u32_le()?;
-            let index = c.u8()?;
-            defmt::debug!("key_source_4={=u32:08x} key_index={}", key_source, index);
-            key_index = Some(index);
+            let short = cursor.u16_be()?;
+            let mut addr = [0u8; 16];
+            addr[0] = 0xfe;
+            addr[1] = 0x80;
+            addr[11] = 0xff;
+            addr[12] = 0xfe;
+            addr[14..16].copy_from_slice(&short.to_be_bytes());
+            Some(addr)
         }
-
         3 => {
-            let key_source = c.u64_le()?;
-            let index = c.u8()?;
-            defmt::debug!("key_source_8={=u64:016x} key_index={}", key_source, index);
-            key_index = Some(index);
+            if let Some(ext_addr) = mac_ext_addr {
+                Some(link_local_from_ext_addr(ext_addr))
+            } else if let Some(short_addr) = mac_short_addr {
+                let mut addr = [0u8; 16];
+                addr[0] = 0xfe;
+                addr[1] = 0x80;
+                addr[11] = 0x00;
+                addr[12] = 0xff;
+                addr[13] = 0xfe;
+                addr[14..16].copy_from_slice(&short_addr.to_be_bytes());
+                Some(addr)
+            } else {
+                None
+            }
         }
-
-        _ => {}
-    }
-
-    Some(MacSecurityHeader {
-        security_control,
-        security_level,
-        key_id_mode,
-        frame_counter,
-        key_index,
-    })
-}
-
-fn mic_len_for_security_level(security_level: u8) -> Option<usize> {
-    match security_level {
-        0 => Some(0),
-        1 | 5 => Some(4),
-        2 | 6 => Some(8),
-        3 | 7 => Some(16),
-        4 => Some(0),
         _ => None,
     }
 }
 
-fn log_secured_payload_split(
-    payload: &[u8],
-    security: MacSecurityHeader,
-    src_ext_addr: Option<u64>,
-    aad: &[u8],
-    thread_keys: Option<&ThreadKeyMaterial>,
-) {
-    let Some(mic_len) = mic_len_for_security_level(security.security_level) else {
-        defmt::warn!("unknown MAC security level={}", security.security_level);
-        return;
-    };
-
-    if payload.len() < mic_len {
-        defmt::warn!(
-            "secured payload too short len={} mic_len={}",
-            payload.len(),
-            mic_len
-        );
-        return;
-    }
-
-    let encrypted_len = payload.len() - mic_len;
-    let encrypted = &payload[..encrypted_len];
-    let mic = &payload[encrypted_len..];
-
-    defmt::debug!(
-        "secured payload split encrypted_len={} mic_len={} key_id_mode={} key_index={:?}",
-        encrypted_len,
-        mic_len,
-        security.key_id_mode,
-        security.key_index
-    );
-
-    if let Some(counter) = security.frame_counter {
-        defmt::debug!("security nonce frame_counter={=u32}", counter);
-    } else {
-        defmt::warn!("security nonce missing frame counter");
-    }
-
-    if let Some(ext_addr) = src_ext_addr {
-        defmt::debug!("security nonce src_ext={=u64:016x}", ext_addr);
-    } else {
-        defmt::warn!("security nonce missing source extended address mapping");
-    }
-
-    defmt::debug!("encrypted={:02x}", encrypted);
-    defmt::debug!("mic={:02x}", mic);
-
-    if let (Some(keys), Some(ext_addr), Some(frame_counter)) =
-        (thread_keys, src_ext_addr, security.frame_counter)
-    {
-        try_decrypt_mac_payload(
-            encrypted,
-            mic,
-            aad,
-            security.security_control,
-            frame_counter,
-            ext_addr,
-            keys,
-        );
-    } else {
-        defmt::info!("MAC decrypt skipped: missing keys, source ext addr, or frame counter");
+fn decode_iphc_multicast_addr(cursor: &mut Cursor, dam: u8) -> Option<[u8; 16]> {
+    match dam {
+        0 => {
+            let mut addr = [0u8; 16];
+            addr.copy_from_slice(cursor.take(16)?);
+            Some(addr)
+        }
+        1 => {
+            let bytes = cursor.take(6)?;
+            let mut addr = [0u8; 16];
+            addr[0] = 0xff;
+            addr[1] = bytes[0];
+            addr[11] = bytes[1];
+            addr[12] = bytes[2];
+            addr[13] = bytes[3];
+            addr[14] = bytes[4];
+            addr[15] = bytes[5];
+            Some(addr)
+        }
+        2 => {
+            let bytes = cursor.take(4)?;
+            let mut addr = [0u8; 16];
+            addr[0] = 0xff;
+            addr[1] = bytes[0];
+            addr[13] = bytes[1];
+            addr[14] = bytes[2];
+            addr[15] = bytes[3];
+            Some(addr)
+        }
+        3 => {
+            let group = cursor.u8()?;
+            let mut addr = [0u8; 16];
+            addr[0] = 0xff;
+            addr[1] = 0x02;
+            addr[15] = group;
+            Some(addr)
+        }
+        _ => None,
     }
 }
 
-fn decode_lowpan_payload(payload: &[u8]) {
-    if payload.is_empty() {
-        defmt::info!("6LoWPAN: empty payload");
-        return;
-    }
-
-    let dispatch = payload[0];
-
-    if dispatch == 0x41 {
-        defmt::info!(
-            "6LoWPAN: uncompressed IPv6 dispatch=0x41 len={}",
-            payload.len()
-        );
-        scan_for_mle_marker(payload);
-        return;
-    }
-
-    if dispatch & 0b1110_0000 == 0b0110_0000 {
-        defmt::info!(
-            "6LoWPAN: IPHC compressed IPv6 dispatch={=u8:02x} len={}",
-            dispatch,
-            payload.len()
-        );
-        decode_iphc_summary(payload);
-        scan_for_mle_marker(payload);
-        return;
-    }
-
-    if dispatch & 0b1111_1000 == 0b1100_0000 {
-        defmt::info!(
-            "6LoWPAN: fragmentation first dispatch={=u8:02x} len={}",
-            dispatch,
-            payload.len()
-        );
-        return;
-    }
-
-    if dispatch & 0b1111_1000 == 0b1110_0000 {
-        defmt::info!(
-            "6LoWPAN: fragmentation subsequent dispatch={=u8:02x} len={}",
-            dispatch,
-            payload.len()
-        );
-        return;
-    }
-
-    if dispatch & 0b1100_0000 == 0b1000_0000 {
-        defmt::info!(
-            "6LoWPAN: mesh header dispatch={=u8:02x} len={}",
-            dispatch,
-            payload.len()
-        );
-        return;
-    }
-
-    if dispatch & 0b1110_0000 == 0b1010_0000 {
-        defmt::info!(
-            "6LoWPAN: broadcast header dispatch={=u8:02x} len={}",
-            dispatch,
-            payload.len()
-        );
-        return;
-    }
-
-    defmt::info!(
-        "6LoWPAN: unknown dispatch={=u8:02x} len={}",
-        dispatch,
-        payload.len()
-    );
-}
-
-fn decode_iphc_summary(payload: &[u8]) {
-    if payload.len() < 2 {
-        defmt::warn!("IPHC: truncated header");
-        return;
-    }
-
-    let b0 = payload[0];
-    let b1 = payload[1];
-
-    let tf = (b0 >> 3) & 0b11;
-    let nh_compressed = (b0 & (1 << 2)) != 0;
-    let hlim = b0 & 0b11;
-
-    let cid = (b1 & (1 << 7)) != 0;
-    let sac = (b1 & (1 << 6)) != 0;
-    let sam = (b1 >> 4) & 0b11;
-    let m = (b1 & (1 << 3)) != 0;
-    let dac = (b1 & (1 << 2)) != 0;
-    let dam = b1 & 0b11;
-
-    defmt::info!(
-        "IPHC: tf={} nh_compressed={} hlim={} cid={} sac={} sam={} multicast={} dac={} dam={}",
-        tf,
-        nh_compressed,
-        hlim,
-        cid,
-        sac,
-        sam,
-        m,
-        dac,
-        dam
-    );
-
-    if nh_compressed {
-        defmt::info!(
-            "IPHC: next header is compressed, likely NHC follows after compressed IPv6 fields"
-        );
-    } else {
-        defmt::info!("IPHC: next header is carried inline");
+fn decode_compressed_udp_ports(cursor: &mut Cursor, udp_ctl: u8) -> Option<(u16, u16)> {
+    match udp_ctl & 0x03 {
+        0 => Some((cursor.u16_be()?, cursor.u16_be()?)),
+        1 => Some((cursor.u16_be()?, 0xf000 | cursor.u8()? as u16)),
+        2 => Some((0xf000 | cursor.u8()? as u16, cursor.u16_be()?)),
+        3 => {
+            let value = cursor.u8()?;
+            Some((
+                0xf0b0 | ((value >> 4) as u16),
+                0xf0b0 | ((value & 0x0f) as u16),
+            ))
+        }
+        _ => None,
     }
 }
 
-fn scan_for_mle_marker(payload: &[u8]) {
-    const MLE_MARKER: &[u8; 4] = b"MLML";
-
-    if payload.len() < MLE_MARKER.len() {
-        return;
-    }
-
-    for i in 0..=payload.len() - MLE_MARKER.len() {
-        if &payload[i..i + MLE_MARKER.len()] == MLE_MARKER {
-            let after = &payload[i + MLE_MARKER.len()..];
-            let preview_len = after.len().min(16);
-
-            defmt::info!(
-                "MLE marker MLML found offset={} after_len={} preview={:02x}",
-                i,
-                after.len(),
-                &after[..preview_len]
-            );
-            decode_mle_candidate(after);
-            return;
-        }
-    }
+fn link_local_from_ext_addr(ext_addr: u64) -> [u8; 16] {
+    let mut addr = [0u8; 16];
+    addr[0] = 0xfe;
+    addr[1] = 0x80;
+    let mut iid = ext_addr.to_be_bytes();
+    iid[0] ^= 0x02;
+    addr[8..16].copy_from_slice(&iid);
+    addr
 }
 
-fn decode_mle_candidate(after_mlml: &[u8]) {
-    if after_mlml.is_empty() {
-        defmt::warn!("MLE: marker found but no bytes after MLML");
-        return;
-    }
-
-    let preview_len = after_mlml.len().min(32);
-
-    defmt::info!("MLE: protected/opaque candidate len={}", after_mlml.len());
-    defmt::info!("MLE: bytes_after_mlml={:02x}", &after_mlml[..preview_len]);
-    defmt::info!(
-        "MLE: not decoding TLVs yet; bytes after MLML appear protected or require proper MLE parsing"
-    );
+fn link_local_all_routers() -> [u8; 16] {
+    let mut addr = [0u8; 16];
+    addr[0] = 0xff;
+    addr[1] = 0x02;
+    addr[15] = 0x02;
+    addr
 }
 
-fn mle_tlv_name(t: u8) -> &'static str {
-    match t {
-        0 => "Source Address",
-        1 => "Mode",
-        2 => "Timeout",
-        3 => "Challenge",
-        4 => "Response",
-        5 => "Link-layer Frame Counter",
-        6 => "MLE Frame Counter",
-        7 => "Route64",
-        8 => "Address16",
-        9 => "Leader Data",
-        10 => "Network Data",
-        11 => "TLV Request",
-        12 => "Scan Mask",
-        13 => "Connectivity",
-        14 => "Link Margin",
-        15 => "Status",
-        16 => "Version",
-        17 => "Address Registration",
-        18 => "Channel",
-        19 => "PAN ID",
-        20 => "Active Timestamp",
-        21 => "Pending Timestamp",
-        22 => "Active Operational Dataset",
-        23 => "Pending Operational Dataset",
-        24 => "Thread Discovery",
-        25 => "Unknown-25",
-        26 => "Unknown-26",
-        27 => "Unknown-27",
-        28 => "Unknown-28",
-        29 => "Unknown-29",
-        30 => "Unknown-30",
-        31 => "Unknown-31",
-        _ => "Unknown",
-    }
+fn iid_to_ext_addr(iid: &[u8]) -> u64 {
+    let mut ext = [0u8; 8];
+    ext.copy_from_slice(iid);
+    ext[0] ^= 0x02;
+    u64::from_be_bytes(ext)
 }
 
-fn decode_802154(
-    frame: &[u8],
-    lqi: u8,
-    active_pan_id: u16,
-    thread_keys: Option<&ThreadKeyMaterial>,
-    routers: &mut [Option<SeenRouter>; MAX_ROUTERS],
-    short_devices: &mut [Option<SeenShortDevice>; MAX_SHORT_DEVICES],
-) {
-    let mut c = Cursor::new(frame);
-
-    let fcf_raw = match c.u16_le() {
-        Some(v) => v,
-        None => {
-            defmt::warn!("too short: missing FCF len={}", frame.len());
-            return;
-        }
-    };
-
-    let seq = match c.u8() {
-        Some(v) => v,
-        None => {
-            defmt::warn!("too short: missing sequence len={}", frame.len());
-            return;
-        }
-    };
-
-    let fcf = parse_fcf(fcf_raw);
-
-    if fcf.frame_type.is_ack() {
-        defmt::info!("ACK seq={}", seq);
-        return;
-    }
-
-    defmt::info!(
-        "802.15.4 type={} seq={} security={} frame_pending={} ack_req={} pan_comp={} ver={} dst_mode={} src_mode={}",
-        fcf.frame_type,
-        seq,
-        fcf.security_enabled,
-        fcf.frame_pending,
-        fcf.ack_request,
-        fcf.pan_compression,
-        fcf.frame_version,
-        fcf.dst_mode,
-        fcf.src_mode
-    );
-
-    let dst_pan = match parse_dst_addr(&mut c, fcf.dst_mode) {
-        Some(v) => v,
-        None => {
-            defmt::warn!("failed parsing dst addr");
-            return;
-        }
-    };
-
-    if let Some(pan) = dst_pan {
-        if pan != active_pan_id {
-            defmt::debug!("ignore other PAN={=u16:04x}", pan);
-            return;
-        }
-    }
-
-    let src = match parse_src_addr(&mut c, fcf.src_mode, fcf.pan_compression, dst_pan) {
-        Some(v) => v,
-        None => {
-            defmt::warn!("failed parsing src addr");
-            return;
-        }
-    };
-
-    if fcf.frame_type.is_beacon() {
-        if let (Some(pan_id), Some(ext_addr)) = (src.pan_id, src.ext_addr) {
-            if pan_id == active_pan_id {
-                remember_router(routers, ext_addr, pan_id, lqi);
-            }
-        }
-    }
-
-    if let (Some(pan_id), Some(short_addr)) = (src.pan_id, src.short_addr) {
-        if pan_id == active_pan_id {
-            remember_short_device(short_devices, short_addr, pan_id, lqi);
-        }
-    }
-
-    let security = if fcf.security_enabled {
-        match parse_security_header(&mut c) {
-            Some(v) => Some(v),
-            None => {
-                defmt::warn!("failed parsing security header");
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
-    let header_len = c.pos();
-    let aad = &frame[..header_len];
-    defmt::info!("header_len={} remaining_len={}", header_len, c.remaining());
-
-    if let Some(security) = security {
-        log_secured_payload_split(
-            c.remaining_slice(),
-            security,
-            src.best_known_ext_addr(),
-            aad,
-            thread_keys,
-        );
-        defmt::info!(
-            "payload is MAC-secured/encrypted; skipping 6LoWPAN decode until AES-CCM is added"
-        );
-    } else {
-        defmt::debug!("unsecured payload len={}", c.remaining());
-    }
-}
-
-fn derive_thread_key_material(
-    dataset: &ActiveDataset,
-    key_sequence: u32,
-) -> Option<ThreadKeyMaterial> {
-    let network_key = dataset.network_key?;
-
-    let mut hmac = <HmacSha256 as Mac>::new_from_slice(&network_key).ok()?;
-
-    hmac.update(&key_sequence.to_be_bytes());
-    hmac.update(b"Thread");
-
-    let hash = hmac.finalize().into_bytes();
-
-    let mut mle_key = [0u8; 16];
-    let mut mac_key = [0u8; 16];
-
-    mle_key.copy_from_slice(&hash[..16]);
-    mac_key.copy_from_slice(&hash[16..32]);
-
-    Some(ThreadKeyMaterial {
-        key_sequence,
-        key_id: ((key_sequence & 0x7f) as u8).wrapping_add(1),
-        mle_key,
-        mac_key,
-    })
-}
-
-fn log_thread_key_material(keys: &ThreadKeyMaterial) {
-    defmt::info!("=== Thread Key Material ===");
-    defmt::info!(
-        "key_sequence={=u32} key_id={}",
-        keys.key_sequence,
-        keys.key_id
-    );
-    defmt::info!("mle_key=derived len=16");
-    defmt::info!("mac_key=derived len=16");
-
-    // Keep these debug-only because they are secrets.
-    defmt::debug!("mle_key_debug={:02x}", keys.mle_key);
-    defmt::debug!("mac_key_debug={:02x}", keys.mac_key);
-}
-
-fn try_decrypt_mac_payload(
-    encrypted: &[u8],
-    mic: &[u8],
-    aad: &[u8],
-    security_control: u8,
-    frame_counter: u32,
-    src_ext_addr: u64,
-    keys: &ThreadKeyMaterial,
-) {
-    if mic.len() != 4 {
-        defmt::info!("MAC decrypt skipped: only MIC-32/security level 5 supported now");
-        return;
-    }
-
+fn build_mle_nonce(src_ext_addr: u64, frame_counter: u32) -> [u8; 13] {
     let mut nonce = [0u8; 13];
-
-    // IEEE 802.15.4 nonce:
-    // source extended address || frame counter || security control.
-    // Use network/wire byte order here, not the little-endian parsing order.
     nonce[0..8].copy_from_slice(&src_ext_addr.to_be_bytes());
     nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
-    nonce[12] = security_control;
-
-    let mut buffer: Vec<u8, 128> = Vec::new();
-
-    if buffer.extend_from_slice(encrypted).is_err() {
-        defmt::warn!("MAC decrypt failed: encrypted payload too large");
-        return;
-    }
-
-    let cipher = AesCcmMic4::new_from_slice(&keys.mac_key).unwrap();
-
-    match cipher.decrypt_in_place_detached((&nonce).into(), aad, &mut buffer, mic.into()) {
-        Ok(()) => {
-            defmt::info!("MAC decrypt OK plaintext={:02x}", buffer.as_slice());
-            decode_mac_command_plaintext(buffer.as_slice());
-        }
-        Err(_) => {
-            defmt::warn!("MAC decrypt failed: MIC mismatch or wrong nonce/key");
-            defmt::debug!("MAC decrypt nonce={:02x}", nonce);
-            defmt::debug!("MAC decrypt aad={:02x}", aad);
-        }
-    }
+    nonce[12] = MLE_SECURITY_CONTROL;
+    nonce
 }
 
-fn decode_mac_command_plaintext(plaintext: &[u8]) {
-    if plaintext.is_empty() {
-        defmt::info!("MAC plaintext empty");
-        return;
+fn build_mle_aad(
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+    security_header: &[u8],
+) -> Option<Vec<u8, 64>> {
+    let mut aad = Vec::new();
+    aad.extend_from_slice(&src_addr).ok()?;
+    aad.extend_from_slice(&dst_addr).ok()?;
+    aad.extend_from_slice(security_header).ok()?;
+    Some(aad)
+}
+
+fn build_parent_request_challenge(seed: u8) -> [u8; 8] {
+    [
+        0xa5,
+        0x5a,
+        seed,
+        seed.wrapping_add(1),
+        seed.wrapping_add(2),
+        seed ^ 0x55,
+        seed ^ 0xaa,
+        0x11,
+    ]
+}
+
+fn udp_checksum(
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+    udp_header: &[u8; 8],
+    payload: &[u8],
+) -> u16 {
+    let mut sum = 0u32;
+
+    for chunk in src_addr.chunks(2) {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    for chunk in dst_addr.chunks(2) {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
     }
 
-    let command_id = plaintext[0];
+    let udp_len = (udp_header.len() + payload.len()) as u32;
+    sum = sum.wrapping_add((udp_len >> 16) & 0xffff);
+    sum = sum.wrapping_add(udp_len & 0xffff);
+    sum = sum.wrapping_add(17);
 
-    let name = match command_id {
-        0x01 => "Association Request",
-        0x02 => "Association Response",
-        0x03 => "Disassociation Notification",
-        0x04 => "Data Request",
-        0x05 => "PAN ID Conflict Notification",
-        0x06 => "Orphan Notification",
-        0x07 => "Beacon Request",
-        0x08 => "Coordinator Realignment",
-        0x09 => "GTS Request",
-        _ => "Unknown MAC Command",
-    };
+    for chunk in udp_header.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], 0])
+        };
+        sum = sum.wrapping_add(word as u32);
+    }
 
-    defmt::info!(
-        "MAC command plaintext id={=u8:02x} name={}",
-        command_id,
-        name
-    );
+    for chunk in payload.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            u16::from_be_bytes([chunk[0], 0])
+        };
+        sum = sum.wrapping_add(word as u32);
+    }
+
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+
+    !(sum as u16)
+}
+
+fn push_tlv<const N: usize>(out: &mut Vec<u8, N>, tlv_type: u8, value: &[u8]) -> Option<()> {
+    out.push(tlv_type).ok()?;
+    out.push(value.len() as u8).ok()?;
+    out.extend_from_slice(value).ok()?;
+    Some(())
+}
+
+fn push_u16_le<const N: usize>(out: &mut Vec<u8, N>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes()).ok();
+}
+
+fn crc8(data: &[u8]) -> u8 {
+    let mut crc = 0xffu8;
+
+    for &byte in data {
+        crc ^= byte;
+        for _ in 0..8 {
+            if crc & 0x80 != 0 {
+                crc = (crc << 1) ^ 0x31;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+
+    crc
+}
+
+fn parse_hex_array(hex: &[u8], value_start: usize, out: &mut [u8]) -> bool {
+    for i in 0..out.len() {
+        let Some(byte) = parse_hex_u8(hex, value_start + i * 2) else {
+            return false;
+        };
+        out[i] = byte;
+    }
+
+    true
+}
+
+fn parse_hex_u16_be(hex: &[u8], offset: usize) -> Option<u16> {
+    let hi = parse_hex_u8(hex, offset)?;
+    let lo = parse_hex_u8(hex, offset + 2)?;
+    Some(u16::from_be_bytes([hi, lo]))
+}
+
+fn parse_hex_u8(hex: &[u8], offset: usize) -> Option<u8> {
+    if offset + 2 > hex.len() {
+        return None;
+    }
+
+    let hi = hex_nibble(hex[offset])?;
+    let lo = hex_nibble(hex[offset + 1])?;
+    Some((hi << 4) | lo)
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
