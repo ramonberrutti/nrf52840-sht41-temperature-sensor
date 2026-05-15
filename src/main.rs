@@ -1,6 +1,12 @@
 #![no_std]
 #![no_main]
 
+use aes::Aes128;
+use ccm::{
+    Ccm,
+    aead::{AeadInPlace, KeyInit},
+    consts::{U4, U13},
+};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_nrf::radio;
@@ -13,6 +19,9 @@ use embassy_nrf::{
 };
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_async::i2c::I2c;
+use heapless::Vec;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -33,6 +42,8 @@ const THREAD_DATASET_HEX: Option<&str> = option_env!("THREAD_DATASET");
 const MAX_NETWORK_NAME_LEN: usize = 32;
 
 static mut TX_SEQ: u8 = 0;
+
+const INITIAL_KEY_SEQUENCE: u32 = 0;
 
 #[derive(Clone, Copy)]
 struct SeenRouter {
@@ -65,6 +76,17 @@ struct MacSecurityHeader {
     key_index: Option<u8>,
 }
 
+type HmacSha256 = Hmac<Sha256>;
+type AesCcmMic4 = Ccm<Aes128, U4, U13>;
+
+#[derive(Clone, Copy)]
+struct ThreadKeyMaterial {
+    key_sequence: u32,
+    key_id: u8,
+    mle_key: [u8; 16],
+    mac_key: [u8; 16],
+}
+
 #[derive(Clone, Copy)]
 struct ActiveDataset {
     channel: Option<u8>,
@@ -72,6 +94,16 @@ struct ActiveDataset {
     ext_pan_id: Option<[u8; 8]>,
     network_key: Option<[u8; 16]>,
     network_name: NetworkName,
+}
+
+impl ActiveDataset {
+    fn channel_or_default(&self) -> u8 {
+        self.channel.unwrap_or(DEFAULT_CHANNEL)
+    }
+
+    fn pan_id_or_default(&self) -> u16 {
+        self.pan_id.unwrap_or(DEFAULT_PAN_ID)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -440,8 +472,14 @@ async fn main(spawner: Spawner) {
     let mut radio = Radio::new(p.RADIO, Irqs);
     let active_dataset = parse_thread_dataset_from_env();
     log_active_dataset(&active_dataset);
+    let thread_keys = derive_thread_key_material(&active_dataset, INITIAL_KEY_SEQUENCE);
+    if let Some(keys) = thread_keys {
+        log_thread_key_material(&keys);
+    } else {
+        defmt::warn!("Thread key material not derived; missing or invalid network key");
+    }
 
-    radio.set_channel(active_dataset.channel.unwrap_or(DEFAULT_CHANNEL));
+    radio.set_channel(active_dataset.channel_or_default());
 
     // Change these pins to match your board.
     let sda = p.P0_20;
@@ -484,7 +522,14 @@ async fn main(spawner: Spawner) {
                     frame.len(),
                     packet.lqi()
                 );
-                decode_802154(frame, packet.lqi(), &mut routers, &mut short_devices);
+                decode_802154(
+                    frame,
+                    packet.lqi(),
+                    active_dataset.pan_id_or_default(),
+                    thread_keys.as_ref(),
+                    &mut routers,
+                    &mut short_devices,
+                );
                 defmt::debug!("raw={:02x}", frame);
 
                 beacon_timer += 1;
@@ -493,8 +538,10 @@ async fn main(spawner: Spawner) {
                 }
 
                 if last_router_table_print.elapsed() >= Duration::from_secs(5) {
-                    print_router_table(&routers);
-                    print_short_device_table(&short_devices);
+                    let active_pan_id = active_dataset.pan_id_or_default();
+                    print_router_table(active_pan_id, &routers);
+                    print_short_device_table(active_pan_id, &short_devices);
+                    log_best_parent_candidate(&routers);
                     last_router_table_print = Instant::now();
                 }
             }
@@ -647,8 +694,8 @@ fn remember_short_device(
     defmt::warn!("short device table full");
 }
 
-fn print_router_table(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
-    defmt::info!("=== Thread routers on PAN {=u16:04x} ===", DEFAULT_PAN_ID);
+fn print_router_table(active_pan_id: u16, routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
+    defmt::info!("=== Thread routers on PAN {=u16:04x} ===", active_pan_id);
 
     let mut seen = 0u8;
 
@@ -670,8 +717,11 @@ fn print_router_table(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
     }
 }
 
-fn print_short_device_table(short_devices: &[Option<SeenShortDevice>; MAX_SHORT_DEVICES]) {
-    defmt::info!("=== Short addresses on PAN {=u16:04x} ===", DEFAULT_PAN_ID);
+fn print_short_device_table(
+    active_pan_id: u16,
+    short_devices: &[Option<SeenShortDevice>; MAX_SHORT_DEVICES],
+) {
+    defmt::info!("=== Short addresses on PAN {=u16:04x} ===", active_pan_id);
 
     let mut seen = 0u8;
 
@@ -703,6 +753,30 @@ fn print_short_device_table(short_devices: &[Option<SeenShortDevice>; MAX_SHORT_
 
     if seen == 0 {
         defmt::info!("no short addresses seen yet");
+    }
+}
+
+fn log_best_parent_candidate(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
+    let mut best: Option<SeenRouter> = None;
+
+    for router in routers.iter().flatten() {
+        match best {
+            Some(current) if current.last_lqi >= router.last_lqi => {}
+            _ => best = Some(*router),
+        }
+    }
+
+    if let Some(router) = best {
+        defmt::info!(
+            "parent candidate ext={=u64:016x} pan={=u16:04x} lqi={} beacon_count={}",
+            router.ext_addr,
+            router.pan_id,
+            router.last_lqi,
+            router.count
+        );
+        defmt::info!("join state: would send MLE Parent Request to best router candidate next");
+    } else {
+        defmt::info!("join state: no parent candidate yet; keep scanning");
     }
 }
 
@@ -1040,6 +1114,8 @@ fn log_secured_payload_split(
     payload: &[u8],
     security: MacSecurityHeader,
     src_ext_addr: Option<u64>,
+    aad: &[u8],
+    thread_keys: Option<&ThreadKeyMaterial>,
 ) {
     let Some(mic_len) = mic_len_for_security_level(security.security_level) else {
         defmt::warn!("unknown MAC security level={}", security.security_level);
@@ -1081,6 +1157,22 @@ fn log_secured_payload_split(
 
     defmt::debug!("encrypted={:02x}", encrypted);
     defmt::debug!("mic={:02x}", mic);
+
+    if let (Some(keys), Some(ext_addr), Some(frame_counter)) =
+        (thread_keys, src_ext_addr, security.frame_counter)
+    {
+        try_decrypt_mac_payload(
+            encrypted,
+            mic,
+            aad,
+            security.security_control,
+            frame_counter,
+            ext_addr,
+            keys,
+        );
+    } else {
+        defmt::info!("MAC decrypt skipped: missing keys, source ext addr, or frame counter");
+    }
 }
 
 fn decode_lowpan_payload(payload: &[u8]) {
@@ -1276,6 +1368,8 @@ fn mle_tlv_name(t: u8) -> &'static str {
 fn decode_802154(
     frame: &[u8],
     lqi: u8,
+    active_pan_id: u16,
+    thread_keys: Option<&ThreadKeyMaterial>,
     routers: &mut [Option<SeenRouter>; MAX_ROUTERS],
     short_devices: &mut [Option<SeenShortDevice>; MAX_SHORT_DEVICES],
 ) {
@@ -1326,7 +1420,7 @@ fn decode_802154(
     };
 
     if let Some(pan) = dst_pan {
-        if pan != DEFAULT_PAN_ID {
+        if pan != active_pan_id {
             defmt::debug!("ignore other PAN={=u16:04x}", pan);
             return;
         }
@@ -1342,14 +1436,14 @@ fn decode_802154(
 
     if fcf.frame_type.is_beacon() {
         if let (Some(pan_id), Some(ext_addr)) = (src.pan_id, src.ext_addr) {
-            if pan_id == DEFAULT_PAN_ID {
+            if pan_id == active_pan_id {
                 remember_router(routers, ext_addr, pan_id, lqi);
             }
         }
     }
 
     if let (Some(pan_id), Some(short_addr)) = (src.pan_id, src.short_addr) {
-        if pan_id == DEFAULT_PAN_ID {
+        if pan_id == active_pan_id {
             remember_short_device(short_devices, short_addr, pan_id, lqi);
         }
     }
@@ -1366,14 +1460,137 @@ fn decode_802154(
         None
     };
 
-    defmt::info!("header_len={} remaining_len={}", c.pos(), c.remaining());
+    let header_len = c.pos();
+    let aad = &frame[..header_len];
+    defmt::info!("header_len={} remaining_len={}", header_len, c.remaining());
 
     if let Some(security) = security {
-        log_secured_payload_split(c.remaining_slice(), security, src.best_known_ext_addr());
+        log_secured_payload_split(
+            c.remaining_slice(),
+            security,
+            src.best_known_ext_addr(),
+            aad,
+            thread_keys,
+        );
         defmt::info!(
             "payload is MAC-secured/encrypted; skipping 6LoWPAN decode until AES-CCM is added"
         );
     } else {
         decode_lowpan_payload(c.remaining_slice());
     }
+}
+
+fn derive_thread_key_material(
+    dataset: &ActiveDataset,
+    key_sequence: u32,
+) -> Option<ThreadKeyMaterial> {
+    let network_key = dataset.network_key?;
+
+    let mut hmac = <HmacSha256 as Mac>::new_from_slice(&network_key).ok()?;
+
+    hmac.update(&key_sequence.to_be_bytes());
+    hmac.update(b"Thread");
+
+    let hash = hmac.finalize().into_bytes();
+
+    let mut mle_key = [0u8; 16];
+    let mut mac_key = [0u8; 16];
+
+    mle_key.copy_from_slice(&hash[..16]);
+    mac_key.copy_from_slice(&hash[16..32]);
+
+    Some(ThreadKeyMaterial {
+        key_sequence,
+        key_id: ((key_sequence & 0x7f) as u8).wrapping_add(1),
+        mle_key,
+        mac_key,
+    })
+}
+
+fn log_thread_key_material(keys: &ThreadKeyMaterial) {
+    defmt::info!("=== Thread Key Material ===");
+    defmt::info!(
+        "key_sequence={=u32} key_id={}",
+        keys.key_sequence,
+        keys.key_id
+    );
+    defmt::info!("mle_key=derived len=16");
+    defmt::info!("mac_key=derived len=16");
+
+    // Keep these debug-only because they are secrets.
+    defmt::debug!("mle_key_debug={:02x}", keys.mle_key);
+    defmt::debug!("mac_key_debug={:02x}", keys.mac_key);
+}
+
+fn try_decrypt_mac_payload(
+    encrypted: &[u8],
+    mic: &[u8],
+    aad: &[u8],
+    security_control: u8,
+    frame_counter: u32,
+    src_ext_addr: u64,
+    keys: &ThreadKeyMaterial,
+) {
+    if mic.len() != 4 {
+        defmt::info!("MAC decrypt skipped: only MIC-32/security level 5 supported now");
+        return;
+    }
+
+    let mut nonce = [0u8; 13];
+
+    // IEEE 802.15.4 nonce:
+    // source extended address || frame counter || security control.
+    // Use network/wire byte order here, not the little-endian parsing order.
+    nonce[0..8].copy_from_slice(&src_ext_addr.to_be_bytes());
+    nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
+    nonce[12] = security_control;
+
+    let mut buffer: Vec<u8, 128> = Vec::new();
+
+    if buffer.extend_from_slice(encrypted).is_err() {
+        defmt::warn!("MAC decrypt failed: encrypted payload too large");
+        return;
+    }
+
+    let cipher = AesCcmMic4::new_from_slice(&keys.mac_key).unwrap();
+
+    match cipher.decrypt_in_place_detached((&nonce).into(), aad, &mut buffer, mic.into()) {
+        Ok(()) => {
+            defmt::info!("MAC decrypt OK plaintext={:02x}", buffer.as_slice());
+            decode_mac_command_plaintext(buffer.as_slice());
+        }
+        Err(_) => {
+            defmt::warn!("MAC decrypt failed: MIC mismatch or wrong nonce/key");
+            defmt::debug!("MAC decrypt nonce={:02x}", nonce);
+            defmt::debug!("MAC decrypt aad={:02x}", aad);
+        }
+    }
+}
+
+fn decode_mac_command_plaintext(plaintext: &[u8]) {
+    if plaintext.is_empty() {
+        defmt::info!("MAC plaintext empty");
+        return;
+    }
+
+    let command_id = plaintext[0];
+
+    let name = match command_id {
+        0x01 => "Association Request",
+        0x02 => "Association Response",
+        0x03 => "Disassociation Notification",
+        0x04 => "Data Request",
+        0x05 => "PAN ID Conflict Notification",
+        0x06 => "Orphan Notification",
+        0x07 => "Beacon Request",
+        0x08 => "Coordinator Realignment",
+        0x09 => "GTS Request",
+        _ => "Unknown MAC Command",
+    };
+
+    defmt::info!(
+        "MAC command plaintext id={=u8:02x} name={}",
+        command_id,
+        name
+    );
 }
