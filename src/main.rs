@@ -44,6 +44,8 @@ const MAX_NETWORK_NAME_LEN: usize = 32;
 static mut TX_SEQ: u8 = 0;
 
 const INITIAL_KEY_SEQUENCE: u32 = 0;
+const LOCAL_EXT_ADDR: u64 = 0x0200_0000_0000_0001;
+const LOCAL_FRAME_COUNTER_START: u32 = 1;
 
 #[derive(Clone, Copy)]
 struct SeenRouter {
@@ -85,6 +87,27 @@ struct ThreadKeyMaterial {
     key_id: u8,
     mle_key: [u8; 16],
     mac_key: [u8; 16],
+}
+
+#[derive(Clone, Copy)]
+struct LocalThreadDevice {
+    ext_addr: u64,
+    frame_counter: u32,
+    seq: u8,
+    sent_mac_test: bool,
+}
+
+impl LocalThreadDevice {
+    fn next_seq(&mut self) -> u8 {
+        self.seq = self.seq.wrapping_add(1);
+        self.seq
+    }
+
+    fn next_frame_counter(&mut self) -> u32 {
+        let v = self.frame_counter;
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        v
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -368,6 +391,16 @@ fn lookup_ext_addr(short_addr: u16) -> Option<u64> {
     None
 }
 
+fn lookup_short_addr(ext_addr: u64) -> Option<u16> {
+    for mapping in SHORT_TO_EXT {
+        if mapping.ext_addr == ext_addr {
+            return Some(mapping.short_addr);
+        }
+    }
+
+    None
+}
+
 #[derive(Debug)]
 pub enum Sht41Error<E> {
     I2c(E),
@@ -481,7 +514,7 @@ async fn main(spawner: Spawner) {
 
     radio.set_channel(active_dataset.channel_or_default());
 
-    // Change these pins to match your board.
+    // Keep the temperature sensor task running: later this becomes the Thread application payload.
     let sda = p.P0_20;
     let scl = p.P0_22;
 
@@ -489,12 +522,11 @@ async fn main(spawner: Spawner) {
     twim_config.frequency = twim::Frequency::K100;
 
     let twim_buffer = TWIM_BUFFER.init([0u8; 16]);
-
     let i2c = Twim::new(p.TWISPI0, Irqs, sda, scl, twim_config, twim_buffer);
-
     let sht41 = Sht41::new(i2c);
 
-    info!("SHT41 example started");
+    info!("Thread child attach experiment started");
+    info!("Temperature measurement task started");
 
     spawner.spawn(temperature_measurement(sht41).unwrap());
 
@@ -502,6 +534,18 @@ async fn main(spawner: Spawner) {
     let mut rx_err: u32 = 0;
     let mut routers: [Option<SeenRouter>; MAX_ROUTERS] = [None; MAX_ROUTERS];
     let mut short_devices: [Option<SeenShortDevice>; MAX_SHORT_DEVICES] = [None; MAX_SHORT_DEVICES];
+    let mut local_device = LocalThreadDevice {
+        ext_addr: LOCAL_EXT_ADDR,
+        frame_counter: LOCAL_FRAME_COUNTER_START,
+        seq: 0,
+        sent_mac_test: false,
+    };
+
+    defmt::info!(
+        "local experimental Thread device ext_addr={=u64:016x} frame_counter_start={=u32}",
+        local_device.ext_addr,
+        local_device.frame_counter
+    );
 
     let mut beacon_timer: u32 = 0;
     let mut last_router_table_print = Instant::now();
@@ -541,7 +585,32 @@ async fn main(spawner: Spawner) {
                     let active_pan_id = active_dataset.pan_id_or_default();
                     print_router_table(active_pan_id, &routers);
                     print_short_device_table(active_pan_id, &short_devices);
-                    log_best_parent_candidate(&routers);
+
+                    if let Some(parent) = log_best_parent_candidate(&routers) {
+                        if !local_device.sent_mac_test {
+                            if let Some(keys) = thread_keys.as_ref() {
+                                if let Some(parent_short) = lookup_short_addr(parent.ext_addr) {
+                                    send_secured_mac_data_request(
+                                        &mut radio,
+                                        &active_dataset,
+                                        &mut local_device,
+                                        keys,
+                                        parent_short,
+                                    )
+                                    .await;
+                                    local_device.sent_mac_test = true;
+                                } else {
+                                    defmt::warn!(
+                                        "cannot send MAC TX test: missing short address for parent ext={=u64:016x}",
+                                        parent.ext_addr
+                                    );
+                                }
+                            } else {
+                                defmt::warn!("cannot send MAC TX test: Thread keys not derived");
+                            }
+                        }
+                    }
+
                     last_router_table_print = Instant::now();
                 }
             }
@@ -600,6 +669,79 @@ async fn send_beacon_request(radio: &mut Radio<'_>) {
             defmt::warn!("Beacon Request TX failed");
         }
     }
+}
+
+async fn send_secured_mac_data_request(
+    radio: &mut Radio<'_>,
+    dataset: &ActiveDataset,
+    local: &mut LocalThreadDevice,
+    keys: &ThreadKeyMaterial,
+    parent_short: u16,
+) {
+    let pan_id = dataset.pan_id_or_default();
+    let seq = local.next_seq();
+    let frame_counter = local.next_frame_counter();
+    let security_control = 0x0d;
+
+    // MAC Command frame, security enabled, ACK requested, PAN compression,
+    // IEEE 802.15.4-2006 frame version, dst short, src extended.
+    let fcf: u16 = 0xd86b;
+
+    let mut aad: Vec<u8, 64> = Vec::new();
+    push_u16_le(&mut aad, fcf);
+    aad.push(seq).ok();
+    push_u16_le(&mut aad, pan_id);
+    push_u16_le(&mut aad, parent_short);
+    aad.extend_from_slice(&local.ext_addr.to_le_bytes()).ok();
+    aad.push(security_control).ok();
+    aad.extend_from_slice(&frame_counter.to_le_bytes()).ok();
+    aad.push(keys.key_id).ok();
+
+    let plaintext = [0x04u8]; // MAC Command: Data Request
+
+    let mut nonce = [0u8; 13];
+    nonce[0..8].copy_from_slice(&local.ext_addr.to_be_bytes());
+    nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
+    nonce[12] = security_control;
+
+    let mut encrypted: Vec<u8, 16> = Vec::new();
+    encrypted.extend_from_slice(&plaintext).ok();
+
+    let cipher = <AesCcmMic4 as KeyInit>::new_from_slice(&keys.mac_key).unwrap();
+    let tag = match cipher.encrypt_in_place_detached((&nonce).into(), &aad, &mut encrypted) {
+        Ok(tag) => tag,
+        Err(_) => {
+            defmt::warn!("secured MAC Data Request encryption failed");
+            return;
+        }
+    };
+
+    let mut frame: Vec<u8, 128> = Vec::new();
+    frame.extend_from_slice(&aad).ok();
+    frame.extend_from_slice(&encrypted).ok();
+    frame.extend_from_slice(tag.as_slice()).ok();
+
+    let mut tx = Packet::new();
+    tx.copy_from_slice(frame.as_slice());
+
+    defmt::info!(
+        "TX secured MAC Data Request seq={} pan={=u16:04x} dst_short={=u16:04x} src_ext={=u64:016x} frame_counter={=u32}",
+        seq,
+        pan_id,
+        parent_short,
+        local.ext_addr,
+        frame_counter
+    );
+    defmt::debug!("TX secured MAC frame={:02x}", frame.as_slice());
+
+    match radio.try_send(&mut tx).await {
+        Ok(_) => defmt::info!("secured MAC Data Request sent"),
+        Err(_) => defmt::warn!("secured MAC Data Request TX failed"),
+    }
+}
+
+fn push_u16_le<const N: usize>(out: &mut Vec<u8, N>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes()).ok();
 }
 
 fn remember_router(
@@ -756,7 +898,7 @@ fn print_short_device_table(
     }
 }
 
-fn log_best_parent_candidate(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
+fn log_best_parent_candidate(routers: &[Option<SeenRouter>; MAX_ROUTERS]) -> Option<SeenRouter> {
     let mut best: Option<SeenRouter> = None;
 
     for router in routers.iter().flatten() {
@@ -774,9 +916,11 @@ fn log_best_parent_candidate(routers: &[Option<SeenRouter>; MAX_ROUTERS]) {
             router.last_lqi,
             router.count
         );
-        defmt::info!("join state: would send MLE Parent Request to best router candidate next");
+        defmt::info!("join state: next step is secured MAC TX test toward this parent");
+        Some(router)
     } else {
         defmt::info!("join state: no parent candidate yet; keep scanning");
+        None
     }
 }
 
@@ -952,7 +1096,7 @@ fn parse_dst_addr(c: &mut Cursor, mode: AddrMode) -> Option<Option<u16>> {
             let pan = c.u16_le()?;
             let addr = c.u16_le()?;
 
-            defmt::info!("dst_pan={=u16:04x} dst_short={=u16:04x}", pan, addr);
+            defmt::debug!("dst_pan={=u16:04x} dst_short={=u16:04x}", pan, addr);
             Some(Some(pan))
         }
 
@@ -960,7 +1104,7 @@ fn parse_dst_addr(c: &mut Cursor, mode: AddrMode) -> Option<Option<u16>> {
             let pan = c.u16_le()?;
             let addr = c.u64_le()?;
 
-            defmt::info!("dst_pan={=u16:04x} dst_ext={=u64:016x}", pan, addr);
+            defmt::debug!("dst_pan={=u16:04x} dst_ext={=u64:016x}", pan, addr);
             Some(Some(pan))
         }
 
@@ -987,17 +1131,17 @@ fn parse_src_addr(
         AddrMode::Short => {
             let pan_id = if !pan_compression {
                 let src_pan = c.u16_le()?;
-                defmt::info!("src_pan={=u16:04x}", src_pan);
+                defmt::debug!("src_pan={=u16:04x}", src_pan);
                 Some(src_pan)
             } else if let Some(pan) = dst_pan {
-                defmt::info!("src_pan compressed={=u16:04x}", pan);
+                defmt::debug!("src_pan compressed={=u16:04x}", pan);
                 Some(pan)
             } else {
                 None
             };
 
             let addr = c.u16_le()?;
-            defmt::info!("src_short={=u16:04x}", addr);
+            defmt::debug!("src_short={=u16:04x}", addr);
 
             Some(ParsedSrcAddr {
                 pan_id,
@@ -1009,17 +1153,17 @@ fn parse_src_addr(
         AddrMode::Extended => {
             let pan_id = if !pan_compression {
                 let src_pan = c.u16_le()?;
-                defmt::info!("src_pan={=u16:04x}", src_pan);
+                defmt::debug!("src_pan={=u16:04x}", src_pan);
                 Some(src_pan)
             } else if let Some(pan) = dst_pan {
-                defmt::info!("src_pan compressed={=u16:04x}", pan);
+                defmt::debug!("src_pan compressed={=u16:04x}", pan);
                 Some(pan)
             } else {
                 None
             };
 
             let addr = c.u64_le()?;
-            defmt::info!("src_ext={=u64:016x}", addr);
+            defmt::debug!("src_ext={=u64:016x}", addr);
 
             Some(ParsedSrcAddr {
                 pan_id,
@@ -1043,7 +1187,7 @@ fn parse_security_header(c: &mut Cursor) -> Option<MacSecurityHeader> {
     let frame_counter_suppression = (security_control & (1 << 5)) != 0;
     let asn_in_nonce = (security_control & (1 << 6)) != 0;
 
-    defmt::info!(
+    defmt::debug!(
         "security_control={=u8:02x} level={} key_id_mode={} frame_counter_suppression={} asn_in_nonce={}",
         security_control,
         security_level,
@@ -1054,7 +1198,7 @@ fn parse_security_header(c: &mut Cursor) -> Option<MacSecurityHeader> {
 
     let frame_counter = if !frame_counter_suppression {
         let frame_counter = c.u32_le()?;
-        defmt::info!("frame_counter={=u32}", frame_counter);
+        defmt::debug!("frame_counter={=u32}", frame_counter);
         Some(frame_counter)
     } else {
         None
@@ -1064,26 +1208,26 @@ fn parse_security_header(c: &mut Cursor) -> Option<MacSecurityHeader> {
 
     match key_id_mode {
         0 => {
-            defmt::info!("key_id_mode=implicit");
+            defmt::debug!("key_id_mode=implicit");
         }
 
         1 => {
             let index = c.u8()?;
-            defmt::info!("key_index={}", index);
+            defmt::debug!("key_index={}", index);
             key_index = Some(index);
         }
 
         2 => {
             let key_source = c.u32_le()?;
             let index = c.u8()?;
-            defmt::info!("key_source_4={=u32:08x} key_index={}", key_source, index);
+            defmt::debug!("key_source_4={=u32:08x} key_index={}", key_source, index);
             key_index = Some(index);
         }
 
         3 => {
             let key_source = c.u64_le()?;
             let index = c.u8()?;
-            defmt::info!("key_source_8={=u64:016x} key_index={}", key_source, index);
+            defmt::debug!("key_source_8={=u64:016x} key_index={}", key_source, index);
             key_index = Some(index);
         }
 
@@ -1135,7 +1279,7 @@ fn log_secured_payload_split(
     let encrypted = &payload[..encrypted_len];
     let mic = &payload[encrypted_len..];
 
-    defmt::info!(
+    defmt::debug!(
         "secured payload split encrypted_len={} mic_len={} key_id_mode={} key_index={:?}",
         encrypted_len,
         mic_len,
@@ -1144,13 +1288,13 @@ fn log_secured_payload_split(
     );
 
     if let Some(counter) = security.frame_counter {
-        defmt::info!("security nonce frame_counter={=u32}", counter);
+        defmt::debug!("security nonce frame_counter={=u32}", counter);
     } else {
         defmt::warn!("security nonce missing frame counter");
     }
 
     if let Some(ext_addr) = src_ext_addr {
-        defmt::info!("security nonce src_ext={=u64:016x}", ext_addr);
+        defmt::debug!("security nonce src_ext={=u64:016x}", ext_addr);
     } else {
         defmt::warn!("security nonce missing source extended address mapping");
     }
@@ -1476,7 +1620,7 @@ fn decode_802154(
             "payload is MAC-secured/encrypted; skipping 6LoWPAN decode until AES-CCM is added"
         );
     } else {
-        decode_lowpan_payload(c.remaining_slice());
+        defmt::debug!("unsecured payload len={}", c.remaining());
     }
 }
 
