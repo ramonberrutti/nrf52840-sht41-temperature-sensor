@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
-embassy-nrf = { version = "0.10.0", features = ["nrf52840", "time-driver-rtc1", "gpiote"] }
+embassy-nrf = { version = "0.10.0", features = ["nrf52840", "time-driver-rtc1", "gpiote", "defmt"] }
 embassy-time = { version = "0.5.1" }
 
 embedded-hal-async = "1"
@@ -15,6 +15,8 @@ cortex-m = {version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 panic-probe = { version = "1", features = ["print-defmt"]}
 static_cell = "2"
+
+smoltcp = { version = "0.13.1", default-features = false, features = ["socket-raw", "medium-ieee802154", "proto-sixlowpan", "defmt"] }
 
 hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }

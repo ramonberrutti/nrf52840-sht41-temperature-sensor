@@ -22,6 +22,7 @@ use embedded_hal_async::i2c::I2c;
 use heapless::Vec;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use smoltcp::wire::{Ieee802154Frame, Ieee802154Repr, SixlowpanIphcPacket, SixlowpanIphcRepr};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -74,9 +75,8 @@ const SCAN_MASK_ROUTER_AND_END_DEVICE: u8 = SCAN_MASK_ROUTER | SCAN_MASK_END_DEV
 const DEVICE_MODE_RX_ON_WHEN_IDLE: u8 = 1 << 3;
 const DEVICE_MODE_SECURE_DATA_REQUESTS: u8 = 1 << 2;
 const DEVICE_MODE_FULL_NETWORK_DATA: u8 = 1 << 0;
-const DEVICE_MODE_MED: u8 = DEVICE_MODE_RX_ON_WHEN_IDLE
-    | DEVICE_MODE_SECURE_DATA_REQUESTS
-    | DEVICE_MODE_FULL_NETWORK_DATA;
+const DEVICE_MODE_MED: u8 =
+    DEVICE_MODE_RX_ON_WHEN_IDLE | DEVICE_MODE_SECURE_DATA_REQUESTS | DEVICE_MODE_FULL_NETWORK_DATA;
 
 type HmacSha256 = Hmac<Sha256>;
 type AesCcmMic4 = Ccm<Aes128, U4, U13>;
@@ -407,7 +407,7 @@ async fn main(spawner: Spawner) {
     let mut attach_phase = AttachPhase::Discovering {
         started_at: Instant::now(),
     };
-    send_beacon_request(&mut radio).await;
+    // send_beacon_request(&mut radio).await;
     let mut last_beacon_request = Instant::now();
     let mut last_table_log = Instant::now();
     let mut rx_ok: u32 = 0;
@@ -419,93 +419,31 @@ async fn main(spawner: Spawner) {
         match with_timeout(RX_POLL_TIMEOUT, radio.receive(&mut packet)).await {
             Ok(Ok(())) => {
                 rx_ok = rx_ok.wrapping_add(1);
-                process_received_frame(
-                    &packet,
-                    packet.lqi(),
-                    active_dataset.pan_id_or_default(),
-                    &thread_keys,
-                    &mut routers,
-                    &mut attach_phase,
-                );
+
+                let frame = Ieee802154Frame::new_unchecked(packet.as_ref());
+                let repr = Ieee802154Repr::parse(&frame);
+
+                info!("new frame {}: {:?}", rx_ok, repr);
+                if !frame.security_enabled() {
+                    if let Some(payload) = frame.payload() {
+                        let iphc = SixlowpanIphcPacket::new_unchecked(payload);
+
+                        let iphc_repr = SixlowpanIphcRepr::parse(
+                            &iphc,
+                            frame.src_addr(),
+                            frame.dst_addr(),
+                            &[],
+                        );
+
+                        info!("iphc repr: {}", iphc_repr);
+                    }
+                }
             }
-            Ok(Err(_)) => {
+            Ok(Err(e)) => {
                 rx_err = rx_err.wrapping_add(1);
+                warn!("new receive error {}: {}", rx_err, e);
             }
             Err(_) => {}
-        }
-
-        if last_beacon_request.elapsed() >= BEACON_REQUEST_INTERVAL {
-            send_beacon_request(&mut radio).await;
-            last_beacon_request = Instant::now();
-        }
-
-        if last_table_log.elapsed() >= TABLE_LOG_INTERVAL {
-            print_router_table(active_dataset.pan_id_or_default(), &routers);
-            info!("attach phase={}", attach_phase_name(&attach_phase));
-            info!("rx_ok={} rx_err={}", rx_ok, rx_err);
-            last_table_log = Instant::now();
-        }
-
-        match attach_phase {
-            AttachPhase::Discovering { started_at } => {
-                if started_at.elapsed() >= DISCOVERY_SETTLE_TIME {
-                    let preferred_parent = select_best_parent(&routers);
-
-                    if let Some(parent) = preferred_parent {
-                        let challenge = build_parent_request_challenge(local.next_seq());
-                        info!(
-                            "selected parent ext={=u64:016x} lqi={} beacons={}",
-                            parent.ext_addr, parent.last_lqi, parent.beacon_count
-                        );
-
-                        send_mle_parent_request(
-                            &mut radio,
-                            &active_dataset,
-                            &thread_keys,
-                            &mut local,
-                            challenge,
-                        )
-                        .await;
-
-                        attach_phase = AttachPhase::WaitingParentResponse {
-                            challenge,
-                            sent_at: Instant::now(),
-                            preferred_parent: Some(parent.ext_addr),
-                            best_response: None,
-                        };
-                    } else {
-                        info!("no routers discovered yet; continuing active scan");
-                    }
-                }
-            }
-
-            AttachPhase::WaitingParentResponse {
-                challenge,
-                sent_at,
-                preferred_parent,
-                best_response,
-            } => {
-                if sent_at.elapsed() >= PARENT_RESPONSE_WINDOW {
-                    if let Some(parent) = best_response {
-                        info!(
-                            "parent accepted ext={=u64:016x} rloc16={=?} version={=?} link_margin={=?}",
-                            parent.ext_addr, parent.rloc16, parent.version, parent.link_margin
-                        );
-                        attach_phase = AttachPhase::ParentAccepted { parent };
-                    } else {
-                        warn!("no valid Parent Response received; retrying attach scan");
-                        attach_phase = AttachPhase::Discovering {
-                            started_at: Instant::now(),
-                        };
-                    }
-                } else {
-                    let _ = (challenge, preferred_parent);
-                }
-            }
-
-            AttachPhase::ParentAccepted { parent } => {
-                let _ = parent;
-            }
         }
     }
 }
@@ -562,8 +500,7 @@ async fn send_mle_parent_request(
         keys,
         challenge,
         SCAN_MASK_ROUTER,
-    )
-    else {
+    ) else {
         warn!("failed building MLE Parent Request payload");
         return;
     };
