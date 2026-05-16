@@ -45,12 +45,15 @@ const LOCAL_MLE_FRAME_COUNTER_START: u32 = 1;
 const THREAD_VERSION_1_4: u16 = 5;
 const MLE_UDP_PORT: u16 = 19788;
 const MLE_SECURITY_SUITE_154: u8 = 0x00;
-const MLE_SECURITY_CONTROL: u8 = 0x0d;
+const IEEE802154_SECURITY_LEVEL_ENC_MIC32: u8 = 5;
+const MLE_AUX_SECURITY_CONTROL: u8 = 0x15;
+const MAC_AUX_SECURITY_CONTROL_KEYIDMODE1: u8 = 0x0d;
 const MLE_SECURITY_HEADER_LEN: usize = 10;
 const MLE_SECURITY_TAG_LEN: usize = 4;
 const BEACON_REQUEST_INTERVAL: Duration = Duration::from_secs(2);
 const DISCOVERY_SETTLE_TIME: Duration = Duration::from_secs(5);
 const PARENT_RESPONSE_WINDOW: Duration = Duration::from_secs(3);
+const SECOND_PARENT_REQUEST_DELAY: Duration = Duration::from_millis(200);
 const TABLE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const RX_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -66,7 +69,14 @@ const MLE_TLV_LINK_MARGIN: u8 = 14;
 const MLE_TLV_VERSION: u8 = 16;
 
 const SCAN_MASK_ROUTER: u8 = 1 << 7;
-const DEVICE_MODE_MED: u8 = (1 << 3) | (1 << 0);
+const SCAN_MASK_END_DEVICE: u8 = 1 << 6;
+const SCAN_MASK_ROUTER_AND_END_DEVICE: u8 = SCAN_MASK_ROUTER | SCAN_MASK_END_DEVICE;
+const DEVICE_MODE_RX_ON_WHEN_IDLE: u8 = 1 << 3;
+const DEVICE_MODE_SECURE_DATA_REQUESTS: u8 = 1 << 2;
+const DEVICE_MODE_FULL_NETWORK_DATA: u8 = 1 << 0;
+const DEVICE_MODE_MED: u8 = DEVICE_MODE_RX_ON_WHEN_IDLE
+    | DEVICE_MODE_SECURE_DATA_REQUESTS
+    | DEVICE_MODE_FULL_NETWORK_DATA;
 
 type HmacSha256 = Hmac<Sha256>;
 type AesCcmMic4 = Ccm<Aes128, U4, U13>;
@@ -110,6 +120,7 @@ struct ThreadKeyMaterial {
     key_sequence: u32,
     key_id: u8,
     mle_key: [u8; 16],
+    mac_key: [u8; 16],
 }
 
 #[derive(Clone, Copy)]
@@ -278,10 +289,19 @@ impl<'a> Cursor<'a> {
 
 struct FrameControl {
     frame_type: FrameType,
+    security_enabled: bool,
     pan_compression: bool,
     frame_version: u16,
     dst_mode: AddrMode,
     src_mode: AddrMode,
+}
+
+#[derive(Clone, Copy)]
+struct MacSecurityHeader {
+    security_control: u8,
+    security_level: u8,
+    key_id_mode: u8,
+    frame_counter: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -534,16 +554,24 @@ async fn send_mle_parent_request(
     let seq = local.next_seq();
     let mle_frame_counter = local.next_mle_frame_counter();
 
-    let Some(mle_payload) =
-        build_mle_parent_request_payload(local.ext_addr, mle_frame_counter, keys, challenge)
+    let multicast_dst = link_local_all_routers();
+    let Some(mle_payload) = build_mle_parent_request_payload(
+        local.ext_addr,
+        multicast_dst,
+        mle_frame_counter,
+        keys,
+        challenge,
+        SCAN_MASK_ROUTER,
+    )
     else {
         warn!("failed building MLE Parent Request payload");
         return;
     };
 
+    let src_addr = link_local_from_ext_addr(local.ext_addr);
     let Some(lowpan_payload) = build_uncompressed_ipv6_udp_packet(
-        link_local_from_ext_addr(local.ext_addr),
-        link_local_all_routers(),
+        src_addr,
+        multicast_dst,
         MLE_UDP_PORT,
         MLE_UDP_PORT,
         mle_payload.as_slice(),
@@ -553,7 +581,7 @@ async fn send_mle_parent_request(
     };
 
     let pan_id = dataset.pan_id_or_default();
-    let fcf: u16 = 0xd861; // Data frame, PAN compression, ACK request, dst short, src extended.
+    let fcf: u16 = 0xd841; // Data frame, PAN compression, dst short/broadcast, src extended.
 
     let mut frame: Vec<u8, 127> = Vec::new();
     push_u16_le(&mut frame, fcf);
@@ -572,23 +600,69 @@ async fn send_mle_parent_request(
     );
 
     match radio.try_send(&mut tx).await {
-        Ok(_) => info!("MLE Parent Request sent"),
-        Err(_) => warn!("MLE Parent Request TX failed"),
+        Ok(_) => info!("MLE Parent Request router-only multicast sent"),
+        Err(_) => warn!("MLE Parent Request multicast TX failed"),
+    }
+
+    Timer::after(SECOND_PARENT_REQUEST_DELAY).await;
+
+    let Some(second_mle_payload) = build_mle_parent_request_payload(
+        local.ext_addr,
+        multicast_dst,
+        mle_frame_counter,
+        keys,
+        challenge,
+        SCAN_MASK_ROUTER_AND_END_DEVICE,
+    ) else {
+        warn!("failed building second MLE Parent Request payload");
+        return;
+    };
+
+    let Some(second_lowpan_payload) = build_uncompressed_ipv6_udp_packet(
+        src_addr,
+        multicast_dst,
+        MLE_UDP_PORT,
+        MLE_UDP_PORT,
+        second_mle_payload.as_slice(),
+    ) else {
+        warn!("failed building second IPv6 Parent Request");
+        return;
+    };
+
+    let mut second_frame: Vec<u8, 127> = Vec::new();
+    push_u16_le(&mut second_frame, fcf);
+    second_frame.push(seq.wrapping_add(1)).ok();
+    push_u16_le(&mut second_frame, pan_id);
+    push_u16_le(&mut second_frame, 0xffff);
+    second_frame
+        .extend_from_slice(&local.ext_addr.to_le_bytes())
+        .ok();
+    second_frame
+        .extend_from_slice(second_lowpan_payload.as_slice())
+        .ok();
+
+    let mut second_tx = Packet::new();
+    second_tx.copy_from_slice(second_frame.as_slice());
+
+    match radio.try_send(&mut second_tx).await {
+        Ok(_) => info!("MLE Parent Request router+reed multicast sent"),
+        Err(_) => warn!("second MLE Parent Request multicast TX failed"),
     }
 }
 
 fn build_mle_parent_request_payload(
     src_ext_addr: u64,
+    dst_addr: [u8; 16],
     mle_frame_counter: u32,
     keys: &ThreadKeyMaterial,
     challenge: [u8; 8],
+    scan_mask: u8,
 ) -> Option<Vec<u8, 128>> {
     let src_addr = link_local_from_ext_addr(src_ext_addr);
-    let dst_addr = link_local_all_routers();
 
     let mut payload: Vec<u8, 128> = Vec::new();
     payload.push(MLE_SECURITY_SUITE_154).ok()?;
-    payload.push(MLE_SECURITY_CONTROL).ok()?;
+    payload.push(MLE_AUX_SECURITY_CONTROL).ok()?;
     payload
         .extend_from_slice(&mle_frame_counter.to_le_bytes())
         .ok()?;
@@ -603,7 +677,7 @@ fn build_mle_parent_request_payload(
     plaintext.push(MLE_CMD_PARENT_REQUEST).ok()?;
     push_tlv(&mut plaintext, MLE_TLV_MODE, &[DEVICE_MODE_MED])?;
     push_tlv(&mut plaintext, MLE_TLV_CHALLENGE, &challenge)?;
-    push_tlv(&mut plaintext, MLE_TLV_SCAN_MASK, &[SCAN_MASK_ROUTER])?;
+    push_tlv(&mut plaintext, MLE_TLV_SCAN_MASK, &[scan_mask])?;
     push_tlv(
         &mut plaintext,
         MLE_TLV_VERSION,
@@ -689,8 +763,8 @@ fn process_received_frame(
     }
 
     debug!(
-        "802.15.4 type={} seq={} ver={} dst_mode={} src_mode={}",
-        fcf.frame_type, seq, fcf.frame_version, fcf.dst_mode, fcf.src_mode
+        "802.15.4 type={} seq={} security={} ver={} dst_mode={} src_mode={}",
+        fcf.frame_type, seq, fcf.security_enabled, fcf.frame_version, fcf.dst_mode, fcf.src_mode
     );
 
     let dst_pan = match parse_dst_addr(&mut cursor, fcf.dst_mode) {
@@ -721,10 +795,109 @@ fn process_received_frame(
         return;
     }
 
+    let (payload, effective_src_ext) = if fcf.security_enabled {
+        let Some(security) = parse_security_header(&mut cursor) else {
+            if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+                debug!("drop secured MAC frame: failed parsing aux security header");
+            }
+            return;
+        };
+
+        let aad = &frame[..cursor.i];
+
+        match src.ext_addr {
+            Some(src_ext_addr) => {
+                match decrypt_mac_payload(
+                    cursor.remaining_slice(),
+                    aad,
+                    src_ext_addr,
+                    security,
+                    keys,
+                ) {
+                    Some(plaintext) => (plaintext, Some(src_ext_addr)),
+                    None => return,
+                }
+            }
+            None => {
+                let mut decrypted = None;
+                let mut matched_src_ext = None;
+                let preferred_parent = match *attach_phase {
+                    AttachPhase::WaitingParentResponse {
+                        preferred_parent, ..
+                    } => preferred_parent,
+                    _ => None,
+                };
+
+                if let Some(parent_ext) = preferred_parent {
+                    decrypted = decrypt_mac_payload(
+                        cursor.remaining_slice(),
+                        aad,
+                        parent_ext,
+                        security,
+                        keys,
+                    );
+
+                    if decrypted.is_some() {
+                        matched_src_ext = Some(parent_ext);
+                        if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+                            info!(
+                                "secured MAC decrypt matched preferred parent ext={=u64:016x} short_src={=?}",
+                                parent_ext, src.short_addr
+                            );
+                        }
+                    }
+                }
+
+                if decrypted.is_none() {
+                    for router in routers.iter().flatten() {
+                        if Some(router.ext_addr) == preferred_parent {
+                            continue;
+                        }
+
+                        decrypted = decrypt_mac_payload(
+                            cursor.remaining_slice(),
+                            aad,
+                            router.ext_addr,
+                            security,
+                            keys,
+                        );
+
+                        if decrypted.is_some() {
+                            matched_src_ext = Some(router.ext_addr);
+                            if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+                                info!(
+                                    "secured MAC decrypt matched router ext={=u64:016x} short_src={=?}",
+                                    router.ext_addr, src.short_addr
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                let Some(plaintext) = decrypted else {
+                    if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+                        debug!(
+                            "drop secured MAC frame: no ext nonce candidate matched short_src={=?}",
+                            src.short_addr
+                        );
+                    }
+                    return;
+                };
+
+                (plaintext, matched_src_ext)
+            }
+        }
+    } else {
+        let mut out: Vec<u8, 127> = Vec::new();
+        out.extend_from_slice(cursor.remaining_slice()).ok();
+        (out, src.ext_addr)
+    };
+
     decode_lowpan_payload(
-        cursor.remaining_slice(),
+        payload.as_slice(),
         src.short_addr,
-        src.ext_addr,
+        effective_src_ext,
         keys,
         attach_phase,
     );
@@ -741,6 +914,12 @@ fn decode_lowpan_payload(
         return;
     }
 
+    let payload = strip_lowpan_mesh_header(payload);
+
+    if payload.is_empty() {
+        return;
+    }
+
     if payload[0] == 0x41 {
         decode_uncompressed_ipv6(payload, mac_src_short, mac_src_ext, keys, attach_phase);
         return;
@@ -749,6 +928,47 @@ fn decode_lowpan_payload(
     if payload.len() >= 2 && (payload[0] & 0xe0) == 0x60 {
         decode_iphc_ipv6(payload, mac_src_short, mac_src_ext, keys, attach_phase);
         return;
+    }
+
+    if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+        let preview_len = payload.len().min(8);
+        debug!(
+            "unknown 6LoWPAN dispatch first={=u8:02x} preview={:02x}",
+            payload[0],
+            &payload[..preview_len]
+        );
+    }
+}
+
+fn strip_lowpan_mesh_header(mut payload: &[u8]) -> &[u8] {
+    loop {
+        if payload.is_empty() {
+            return payload;
+        }
+
+        // RFC 4944 mesh header dispatch pattern: `10xxxxxx`.
+        if (payload[0] & 0xc0) != 0x80 {
+            return payload;
+        }
+
+        let mut index = 1usize;
+        let first = payload[0];
+        let origin_is_short = (first & 0x20) == 0;
+        let final_is_short = (first & 0x10) == 0;
+        let hops_inline = (first & 0x0f) != 0x0f;
+
+        if !hops_inline {
+            index += 1;
+        }
+
+        index += if origin_is_short { 2 } else { 8 };
+        index += if final_is_short { 2 } else { 8 };
+
+        if index > payload.len() {
+            return &[];
+        }
+
+        payload = &payload[index..];
     }
 }
 
@@ -953,16 +1173,31 @@ fn decode_mle_message(
     attach_phase: &mut AttachPhase,
 ) {
     if payload.len() < 1 + MLE_SECURITY_HEADER_LEN + 1 + MLE_SECURITY_TAG_LEN {
+        if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+            debug!("drop MLE candidate: too short len={}", payload.len());
+        }
         return;
     }
 
     if payload[0] != MLE_SECURITY_SUITE_154 {
+        if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+            debug!(
+                "drop MLE candidate: unsupported security suite={=u8:02x}",
+                payload[0]
+            );
+        }
         return;
     }
 
     let security_header = &payload[1..1 + MLE_SECURITY_HEADER_LEN];
     let security_control = security_header[0];
-    if security_control != MLE_SECURITY_CONTROL {
+    if security_control != MLE_AUX_SECURITY_CONTROL {
+        if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+            debug!(
+                "drop MLE candidate: security control mismatch={=u8:02x}",
+                security_control
+            );
+        }
         return;
     }
 
@@ -980,6 +1215,12 @@ fn decode_mle_message(
     ]);
 
     if key_sequence != keys.key_sequence {
+        if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+            debug!(
+                "drop MLE candidate: key sequence mismatch rx={} expected={}",
+                key_sequence, keys.key_sequence
+            );
+        }
         return;
     }
 
@@ -1004,11 +1245,28 @@ fn decode_mle_message(
         .decrypt_in_place_detached((&nonce).into(), aad.as_slice(), &mut plaintext, mic.into())
         .is_err()
     {
+        if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+            warn!(
+                "MLE decrypt failed src_iid={:02x} frame_counter={} key_seq={}",
+                &src_addr[8..16],
+                frame_counter,
+                key_sequence
+            );
+        }
         return;
     }
 
     if plaintext.is_empty() {
         return;
+    }
+
+    if matches!(attach_phase, AttachPhase::WaitingParentResponse { .. }) {
+        info!(
+            "RX MLE cmd={=u8:02x} src_iid={:02x} len={}",
+            plaintext[0],
+            &src_addr[8..16],
+            plaintext.len()
+        );
     }
 
     match plaintext[0] {
@@ -1084,6 +1342,13 @@ fn parse_parent_response(
         version,
         response_matches,
     };
+
+    if !response_matches {
+        warn!(
+            "Parent Response challenge mismatch from ext={=u64:016x} rloc16={=?}",
+            response.ext_addr, response.rloc16
+        );
+    }
 
     if response_matches {
         let preferred = preferred_parent == Some(src_ext_addr);
@@ -1231,12 +1496,15 @@ fn derive_thread_key_material(
     let hash = hmac.finalize().into_bytes();
 
     let mut mle_key = [0u8; 16];
+    let mut mac_key = [0u8; 16];
     mle_key.copy_from_slice(&hash[..16]);
+    mac_key.copy_from_slice(&hash[16..32]);
 
     Some(ThreadKeyMaterial {
         key_sequence,
         key_id: ((key_sequence & 0x7f) as u8).wrapping_add(1),
         mle_key,
+        mac_key,
     })
 }
 
@@ -1247,6 +1515,7 @@ fn log_thread_key_material(keys: &ThreadKeyMaterial) {
         keys.key_sequence, keys.key_id
     );
     debug!("mle_key_debug={:02x}", keys.mle_key);
+    debug!("mac_key_debug={:02x}", keys.mac_key);
 }
 
 fn remember_router(
@@ -1331,6 +1600,7 @@ fn parse_fcf(fcf: u16) -> FrameControl {
             3 => FrameType::MacCommand,
             other => FrameType::Unknown(other),
         },
+        security_enabled: (fcf & (1 << 3)) != 0,
         pan_compression: (fcf & (1 << 6)) != 0,
         frame_version: (fcf >> 12) & 0b11,
         dst_mode: parse_addr_mode((fcf >> 10) & 0b11),
@@ -1501,6 +1771,92 @@ fn decode_iphc_multicast_addr(cursor: &mut Cursor, dam: u8) -> Option<[u8; 16]> 
     }
 }
 
+fn parse_security_header(c: &mut Cursor) -> Option<MacSecurityHeader> {
+    let security_control = c.u8()?;
+    let security_level = security_control & 0x07;
+    let key_id_mode = (security_control >> 3) & 0x03;
+    let frame_counter_suppressed = (security_control & (1 << 5)) != 0;
+
+    let frame_counter = if frame_counter_suppressed {
+        None
+    } else {
+        Some(u32::from_le_bytes(c.take(4)?.try_into().ok()?))
+    };
+
+    match key_id_mode {
+        0 => {}
+        1 => {
+            c.u8()?;
+        }
+        2 => {
+            c.take(4)?;
+            c.u8()?;
+        }
+        3 => {
+            c.take(8)?;
+            c.u8()?;
+        }
+        _ => return None,
+    }
+
+    Some(MacSecurityHeader {
+        security_control,
+        security_level,
+        key_id_mode,
+        frame_counter,
+    })
+}
+
+fn mic_len_for_security_level(level: u8) -> Option<usize> {
+    match level {
+        0 => Some(0),
+        1 | 5 => Some(4),
+        2 | 6 => Some(8),
+        3 | 7 => Some(16),
+        4 => Some(0),
+        _ => None,
+    }
+}
+
+fn decrypt_mac_payload(
+    payload: &[u8],
+    aad: &[u8],
+    src_ext_addr: u64,
+    security: MacSecurityHeader,
+    keys: &ThreadKeyMaterial,
+) -> Option<Vec<u8, 127>> {
+    let mic_len = mic_len_for_security_level(security.security_level)?;
+    let frame_counter = security.frame_counter?;
+
+    if security.key_id_mode != 1 || security.security_control != MAC_AUX_SECURITY_CONTROL_KEYIDMODE1
+    {
+        return None;
+    }
+
+    if payload.len() < mic_len {
+        return None;
+    }
+
+    let split = payload.len() - mic_len;
+    let encrypted = &payload[..split];
+    let mic = &payload[split..];
+
+    let mut nonce = [0u8; 13];
+    nonce[0..8].copy_from_slice(&src_ext_addr.to_be_bytes());
+    nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
+    nonce[12] = security.security_level;
+
+    let mut plaintext: Vec<u8, 127> = Vec::new();
+    plaintext.extend_from_slice(encrypted).ok()?;
+
+    let cipher = AesCcmMic4::new_from_slice(&keys.mac_key).ok()?;
+    cipher
+        .decrypt_in_place_detached((&nonce).into(), aad, &mut plaintext, mic.into())
+        .ok()?;
+
+    Some(plaintext)
+}
+
 fn decode_compressed_udp_ports(cursor: &mut Cursor, udp_ctl: u8) -> Option<(u16, u16)> {
     match udp_ctl & 0x03 {
         0 => Some((cursor.u16_be()?, cursor.u16_be()?)),
@@ -1546,7 +1902,7 @@ fn build_mle_nonce(src_ext_addr: u64, frame_counter: u32) -> [u8; 13] {
     let mut nonce = [0u8; 13];
     nonce[0..8].copy_from_slice(&src_ext_addr.to_be_bytes());
     nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
-    nonce[12] = MLE_SECURITY_CONTROL;
+    nonce[12] = IEEE802154_SECURITY_LEVEL_ENC_MIC32;
     nonce
 }
 
