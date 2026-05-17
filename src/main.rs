@@ -18,11 +18,12 @@ use embassy_nrf::{
     twim::{self, Twim},
 };
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use embedded_hal_async::i2c::I2c;
 use heapless::Vec;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use smoltcp::wire::{Ieee802154Frame, Ieee802154Repr, SixlowpanIphcPacket, SixlowpanIphcRepr};
+use smoltcp::wire::{
+    Ieee802154Frame, Ieee802154FrameType, Ieee802154Repr, SixlowpanIphcPacket, SixlowpanIphcRepr,
+};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -366,23 +367,78 @@ async fn main(spawner: Spawner) {
 
                 let frame = Ieee802154Frame::new_unchecked(packet.as_ref());
                 let repr = Ieee802154Repr::parse(&frame);
-
                 info!("new frame {}: {:?}", rx_ok, repr);
-                if !frame.security_enabled() {
-                    if let Some(payload) = frame.payload() {
-                        let iphc = SixlowpanIphcPacket::new_unchecked(payload);
 
-                        let iphc_repr = SixlowpanIphcRepr::parse(
-                            &iphc,
-                            frame.src_addr(),
-                            frame.dst_addr(),
-                            &[],
-                        );
+                if frame.frame_type() != Ieee802154FrameType::Data {
+                    continue;
+                }
 
-                        info!("iphc repr: {}", iphc_repr);
+                let payload = if !frame.security_enabled() {
+                    let mut plaintext: Vec<u8, 127> = Vec::new();
+                    frame.payload().and_then(|payload| {
+                        plaintext.extend_from_slice(payload).ok().map(|_| plaintext)
+                    })
+                } else if frame.payload().is_some() {
+                    // lets decrypt here and then move to a function
+                    let security_key = active_dataset.network_key.unwrap();
+                    let level = frame.security_level();
+
+                    if level == IEEE802154_SECURITY_LEVEL_ENC_MIC32 {
+                        let fc = frame.frame_counter().unwrap();
+                        let src_addr = frame.src_addr().unwrap();
+                        let src = src_addr.as_bytes();
+
+                        if src.len() != 8 {
+                            warn!(
+                                "secured MAC frame needs extended source for nonce, got {} bytes",
+                                src.len()
+                            );
+                            None
+                        } else {
+                            let mut nonce = [0u8; 13];
+                            nonce[0..8].copy_from_slice(src);
+                            nonce[8..12].copy_from_slice(&fc.to_le_bytes());
+                            nonce[12] = level;
+
+                            let aad = frame.mac_header();
+                            let payload = frame.payload().unwrap();
+                            let mic = frame.message_integrity_code().unwrap(); // will be 4 because we already check level 5.
+                            let encrypted_len = payload.len().checked_sub(mic.len()).unwrap();
+
+                            let mut plaintext: Vec<u8, 127> = Vec::new();
+                            if plaintext
+                                .extend_from_slice(&payload[..encrypted_len])
+                                .is_err()
+                            {
+                                None
+                            } else {
+                                let cipher = AesCcmMic4::new_from_slice(&security_key).unwrap();
+                                cipher
+                                    .decrypt_in_place_detached(
+                                        (&nonce).into(),
+                                        aad,
+                                        &mut plaintext,
+                                        mic.into(),
+                                    )
+                                    .unwrap();
+
+                                Some(plaintext)
+                            }
+                        }
+                    } else {
+                        None
                     }
                 } else {
-                    // decrypt_mac_payload
+                    None
+                };
+
+                if let Some(payload) = payload {
+                    let iphc = SixlowpanIphcPacket::new_unchecked(&payload);
+
+                    let iphc_repr =
+                        SixlowpanIphcRepr::parse(&iphc, frame.src_addr(), frame.dst_addr(), &[]);
+
+                    info!("iphc repr: {}", iphc_repr);
                 }
             }
             Ok(Err(e)) => {
@@ -1726,7 +1782,7 @@ fn decrypt_mac_payload(
 
     let mut nonce = [0u8; 13];
     nonce[0..8].copy_from_slice(&src_ext_addr.to_be_bytes());
-    nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
+    nonce[8..12].copy_from_slice(&frame_counter.to_le_bytes());
     nonce[12] = security.security_level;
 
     let mut plaintext: Vec<u8, 127> = Vec::new();
@@ -1784,7 +1840,7 @@ fn iid_to_ext_addr(iid: &[u8]) -> u64 {
 fn build_mle_nonce(src_ext_addr: u64, frame_counter: u32) -> [u8; 13] {
     let mut nonce = [0u8; 13];
     nonce[0..8].copy_from_slice(&src_ext_addr.to_be_bytes());
-    nonce[8..12].copy_from_slice(&frame_counter.to_be_bytes());
+    nonce[8..12].copy_from_slice(&frame_counter.to_le_bytes());
     nonce[12] = IEEE802154_SECURITY_LEVEL_ENC_MIC32;
     nonce
 }
